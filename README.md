@@ -13,7 +13,7 @@ Carlo's personal global configuration for [opencode](https://opencode.ai), kept 
 
 ## Bootstrap on a new machine
 
-1. Clone into `~/.config/opencode/` (e.g. `git clone <repo-url> ~/.config/opencode`)
+1. Clone into `~/.config/opencode/` (e.g. `git clone https://github.com/cavenditti/opencode-config.git ~/.config/opencode`)
 2. Install the plugin dependency: `pnpm install`
 3. Restart opencode so the new config is loaded.
 

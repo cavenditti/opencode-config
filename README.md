@@ -9,12 +9,12 @@ Carlo's personal global configuration for [opencode](https://opencode.ai), kept 
 | `opencode.jsonc` | main config (model, default agent, schema) |
 | `agent/` | custom subagents (orchestrator, mid, junior, reviewer, guru) |
 | `package.json` | plugin dependencies |
-| `bun.lock` | lockfile (bun is the package manager) |
+| `pnpm-lock.yaml` | lockfile (pnpm is the package manager) |
 
 ## Bootstrap on a new machine
 
 1. Clone into `~/.config/opencode/` (e.g. `git clone <repo-url> ~/.config/opencode`)
-2. Install the plugin dependency: `bun install` (or `npm install`)
+2. Install the plugin dependency: `pnpm install`
 3. Restart opencode so the new config is loaded.
 
 ## Notes

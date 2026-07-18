@@ -1,8 +1,10 @@
 # Dependencies
 node_modules/
 
-# Lockfiles — bun.lock is the primary lockfile; ignore npm's
+# Lockfiles — pnpm-lock.yaml is the primary lockfile; ignore others'
 package-lock.json
+bun.lock
+bun.lockb
 
 # Local overrides & secrets (never publish these)
 opencode.local.json

@@ -7,7 +7,7 @@ Carlo's personal global configuration for [opencode](https://opencode.ai), kept 
 | Path | Description |
 |------|-------------|
 | `opencode.jsonc` | main config (model, default agent, schema) |
-| `agent/` | custom subagents (orchestrator, mid, junior, reviewer, guru) |
+| `agent/` | custom subagents (orchestrator, coder, reviewer, guru) |
 | `plugin/` | guarded bash tool with deepseek-v4-flash safety classifier |
 | `package.json` | plugin dependencies |
 | `pnpm-lock.yaml` | lockfile (pnpm is the package manager) |

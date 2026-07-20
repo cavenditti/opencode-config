@@ -21,7 +21,7 @@ const userMessageCache = new Map<string, CachedUserMessage>()
 const MAX_USER_MESSAGE_CACHE_SIZE = 16
 const MAX_USER_MESSAGE_LENGTH = 1500
 
-export function getCachedUserMessage(sessionID: string): string | null {
+function getCachedUserMessage(sessionID: string): string | null {
   const entry = userMessageCache.get(sessionID)
   if (!entry) return null
   return entry.text.slice(0, MAX_USER_MESSAGE_LENGTH) || null

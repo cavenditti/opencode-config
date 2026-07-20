@@ -71,6 +71,15 @@ Your job is NOT to edit files. You are a read-only plan author.
 
 Output: headed `Mode: PLAN`, then the plan. No edits to any file.
 
+## Editing tools (IMPLEMENT mode)
+
+- New file → `write`. Tiny exact replacement (one or two lines, unique anchor) → `edit`/`apply_patch`.
+- Ordinary existing-file edit → `morph_edit` (Morph fast-apply: you send only the changed fragments, it merges and writes).
+- `morph_edit` contract: `instructions` = one first-person sentence stating the edit's intent; `code_edit` = ONLY the changed lines with `// ... existing code ...` for every unchanged region (omitting the marker deletes code); preserve indentation; batch all same-file edits into one call; `model` defaults to `auto` — pass `large` for ambiguous anchors, repeated structures, very large files, or many separated edits.
+- It returns a unified diff — review it, then run the project's formatter/type-checker/tests per the done-bar. `morph_edit` bypasses opencode's formatter hooks, so run the formatter yourself.
+- On `CONCURRENT_MODIFICATION`: re-read the file, rebuild `code_edit` against the new content, retry once.
+- Cross-file changes: one `morph_edit` call per file. Never use it on secrets/credential files — secret patterns (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `*.pfx`, `*.keystore`) are hard-denied; contents would otherwise be sent to OpenRouter.
+
 # Rules for both modes
 - Follow existing repo conventions when editing (IMPLEMENT mode only).
 - Do not add comments to code unless explicitly asked.

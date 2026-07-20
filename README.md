@@ -68,7 +68,7 @@ The guarded `bash` tool in `plugin/bash.ts` overrides the built-in bash tool. It
 ### Validation gates
 
 - **Worktree confinement**: target must resolve (via `realpath`) inside `context.worktree`; symlink escapes blocked.
-- **Secret-file denylist**: basename matching `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `id_rsa.*`, `*.pfx`, `*.keystore` is hard-denied (`SECRET_FILE`) — content never sent to OpenRouter.
+- **Secret-file denylist**: basename matching `.env*`, `*.pem`, `*.key`, `id_rsa*`, `*.pfx`, `*.keystore` is hard-denied (`SECRET_FILE`) — content never sent to OpenRouter.
 - **Non-empty + valid UTF-8 output.**
 - **SHA-256 of original file** before the Morph call; recheck immediately before atomic write; mismatch → `CONCURRENT_MODIFICATION` (caller retries).
 - **Atomic write**: same-directory temp file + `rename`.

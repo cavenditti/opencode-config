@@ -4,7 +4,7 @@
   "model": "openrouter/z-ai/glm-5.2",
   "small_model": "openrouter/deepseek/deepseek-v4-flash",
 
-  "plugin": ["./plugin/bash.ts"],
+  "plugin": ["./plugin/bash.ts", "./plugin/enforce.ts"],
 
   "permission": {
     "bash": "ask",

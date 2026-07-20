@@ -9,6 +9,7 @@
   "permission": {
     "bash": "ask",
     "edit": "ask",
+    "morph_edit": "allow",
     "external_directory": "deny",
     "task": "ask"
   }

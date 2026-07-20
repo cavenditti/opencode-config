@@ -160,6 +160,14 @@ async function callMorph(
 
     const json = await response.json()
     const content = json?.choices?.[0]?.message?.content
+    if (json?.choices?.[0]?.finish_reason === "length") {
+      return {
+        ok: false,
+        code: "HTTP_ERROR",
+        message:
+          "Morph response was truncated (finish_reason=length). The file may exceed the model's completion cap. Try model: \"large\" or split the edit.",
+      }
+    }
     if (typeof content !== "string" || content.trim().length === 0) {
       return { ok: false, code: "EMPTY_OUTPUT", message: "Morph returned an empty response." }
     }
@@ -324,6 +332,12 @@ export default tool({
         return failure("NON_UTF8", "File is not valid UTF-8 (binary or legacy encoding). morph_edit only supports UTF-8 text files.")
       }
 
+      // TextDecoder strips a UTF-8 BOM from `original`; detect it from the raw bytes so
+      // the written file keeps the on-disk encoding (BOM, CRLF) and diffs stay noise-free.
+      const hasBOM = buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf
+      const hasCRLF = original.includes("\r\n")
+      const originalOnDisk = hasBOM ? "\uFEFF" + original : original
+
       const sha256Before = createHash("sha256").update(buf).digest("hex")
 
       const apiKey = resolveOpenRouterKey()
@@ -348,7 +362,7 @@ export default tool({
       let fallbackReason: string | undefined
       let result = await callMorph(firstModelId, args.instructions, original, args.code_edit, apiKey, context)
 
-      if (!result.ok && requested === "auto") {
+      if (!result.ok && requested === "auto" && !context.abort.aborted) {
         fallbackOccurred = true
         fallbackReason = `morph-v3-fast failed (${result.code}): ${result.message}`
         modelUsed = "large"
@@ -367,12 +381,21 @@ export default tool({
       }
 
       let merged = result.content
-      const wantNewline = original.endsWith("\n")
-      merged = merged.replace(/\n+$/, "") + (wantNewline ? "\n" : "")
+      if (hasCRLF) merged = merged.replace(/\r?\n/g, "\r\n")
+      if (hasBOM) merged = "\uFEFF" + merged
+
+      // Preserve the original's exact trailing newline sequence.
+      // Morph may drop or alter trailing newlines; restore the original's.
+      const trailingBreaks = hasCRLF ? /(?:\r\n|\n)*$/ : /\n*$/
+      const origTrailing = originalOnDisk.match(trailingBreaks)?.[0] ?? ""
+      const mergedTrailing = merged.match(trailingBreaks)?.[0] ?? ""
+      if (origTrailing !== mergedTrailing) {
+        merged = merged.replace(trailingBreaks, "") + origTrailing
+      }
 
       const encodingSuspect = merged.includes("�") && !original.includes("�")
 
-      if (merged === original) {
+      if (merged === originalOnDisk) {
         return {
           title: `Morph edit applied (morph-v3-${modelUsed}, +0/-0)`,
           output:
@@ -404,12 +427,12 @@ export default tool({
       try {
         const origPath = join(tmpDir, "orig")
         const mergedPath = join(tmpDir, "merged")
-        writeFileSync(origPath, original, "utf8")
+        writeFileSync(origPath, originalOnDisk, "utf8")
         writeFileSync(mergedPath, merged, "utf8")
         const rel = relative(realRoot, realTarget)
         let run = await runDiff(["diff", "-u", "--label", `a/${rel}`, "--label", `b/${rel}`, origPath, mergedPath])
         if (run.kind === "error") {
-          run = await runDiff(["git", "diff", "--no-index", "--", origPath, mergedPath])
+          run = await runDiff(["git", "-c", "color.ui=false", "-c", "diff.external=", "diff", "--no-index", "--", origPath, mergedPath])
         }
         if (run.kind === "differences") {
           diffText = run.stdout
@@ -447,8 +470,8 @@ export default tool({
         }
       }
 
-      const { added, removed } = diffUnavailable ? countLinesFallback(original, merged) : countDiffLines(diffText)
-      const originalLineCount = original.split("\n").length
+      const { added, removed } = diffUnavailable ? countLinesFallback(originalOnDisk, merged) : countDiffLines(diffText)
+      const originalLineCount = originalOnDisk.split("\n").length
       const changeRatio = (added + removed) / Math.max(originalLineCount, 1)
       const rewriteSuspected = changeRatio > changeRatioWarn()
 
@@ -459,6 +482,23 @@ export default tool({
         return failure(
           "CONCURRENT_MODIFICATION",
           "file was removed while Morph was merging — re-read, rebuild your code_edit, retry",
+          { route: "openrouter", modelUsed },
+        )
+      }
+      let realRecheck: string
+      try {
+        realRecheck = realpathSync(realTarget)
+      } catch {
+        return failure(
+          "CONCURRENT_MODIFICATION",
+          "file was removed while Morph was merging — re-read, rebuild your code_edit, retry",
+          { route: "openrouter", modelUsed },
+        )
+      }
+      if (isSecretPath(realRecheck)) {
+        return failure(
+          "CONCURRENT_MODIFICATION",
+          "File changed on disk during the Morph call. Re-read it, rebuild your code_edit against the new content, and retry.",
           { route: "openrouter", modelUsed },
         )
       }
@@ -538,6 +578,8 @@ export default tool({
           diffTruncated,
           ...(encodingSuspect ? { encodingSuspect: true } : {}),
           ...(diffUnavailable ? { diffUnavailable: true } : {}),
+          ...(hasCRLF ? { lineEndingsPreserved: true } : {}),
+          ...(hasBOM ? { bomPreserved: true } : {}),
         },
       }
     } catch (error) {

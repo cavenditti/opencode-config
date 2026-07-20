@@ -79,12 +79,10 @@ function resolveRequestedModel(arg: ModelChoice | undefined): ModelChoice {
 function isSecretPath(realTarget: string): boolean {
   const base = basename(realTarget).toLowerCase()
   return (
-    base === ".env" ||
-    base.startsWith(".env.") ||
+    base.startsWith(".env") ||
     base.endsWith(".pem") ||
     base.endsWith(".key") ||
-    base === "id_rsa" ||
-    base.startsWith("id_rsa.") ||
+    base.startsWith("id_rsa") ||
     base.endsWith(".pfx") ||
     base.endsWith(".keystore")
   )
@@ -243,7 +241,7 @@ export default tool({
     "MARKER CONTRACT: `code_edit` contains ONLY the changed lines. Represent every unchanged region with a `// ... existing code ...` marker line — omitting the marker DELETES that code. Preserve exact indentation. Batch all edits to the same file into a single call.\n\n" +
     "ROUTING: new file → use `write`. Tiny, exact, unambiguous replacement → use `edit`/`apply_patch`. Ordinary edit to an existing file → use morph_edit (leave `model` at its default `auto`). Complex or ambiguous anchors, repeated structures, large files, or many separated edits → morph_edit with `model: \"large\"`.\n\n" +
     "RULES: existing files only (morph_edit refuses new files and directories). Worktree only (paths resolving outside the session worktree are denied).\n\n" +
-    "PRIVACY: the full file contents are sent to OpenRouter for the merge. NEVER use morph_edit on secrets or credential files — secret-file patterns (.env, *.pem, *.key, id_rsa, *.pfx, *.keystore, …) are hard-denied.",
+    "PRIVACY: the full file contents are sent to OpenRouter for the merge. NEVER use morph_edit on secrets or credential files — secret-file patterns (.env*, *.pem, *.key, id_rsa*, *.pfx, *.keystore, …) are hard-denied.",
   args: {
     target_filepath: tool.schema
       .string()

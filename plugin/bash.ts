@@ -1,5 +1,6 @@
 import { tool } from "@opencode-ai/plugin"
 import type { Plugin, ToolContext } from "@opencode-ai/plugin"
+import type { UserMessage, Part, TextPart } from "@opencode-ai/sdk"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -9,6 +10,71 @@ type Verdict = {
   risk: number
   categories: string[]
   reason: string
+}
+
+type CachedUserMessage = {
+  text: string
+  ts: number
+}
+
+const userMessageCache = new Map<string, CachedUserMessage>()
+const MAX_USER_MESSAGE_CACHE_SIZE = 16
+const MAX_USER_MESSAGE_LENGTH = 1500
+
+export function getCachedUserMessage(sessionID: string): string | null {
+  const entry = userMessageCache.get(sessionID)
+  if (!entry) return null
+  return entry.text.slice(0, MAX_USER_MESSAGE_LENGTH) || null
+}
+
+function cacheUserMessage(sessionID: string, text: string): void {
+   if (!userMessageCache.has(sessionID) && userMessageCache.size >= MAX_USER_MESSAGE_CACHE_SIZE) {
+    let oldest: { key: string; ts: number } | null = null
+    for (const [key, value] of userMessageCache) {
+      if (!oldest || value.ts < oldest.ts) {
+        oldest = { key, ts: value.ts }
+      }
+    }
+    if (oldest) {
+      userMessageCache.delete(oldest.key)
+    }
+  }
+  userMessageCache.set(sessionID, { text, ts: Date.now() })
+}
+
+function isUserRoleMessage(message: UserMessage): boolean {
+  return message.role === "user"
+}
+
+function extractTextFromParts(parts: Part[]): string {
+  return parts
+    .filter((part): part is TextPart => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+}
+
+async function chatMessageHook(
+  input: { sessionID: string; agent?: string; model?: { providerID: string; modelID: string }; messageID?: string; variant?: string },
+  output: { message: UserMessage; parts: Part[] },
+): Promise<void> {
+  try {
+    const message = output.message
+    if (!message || !isUserRoleMessage(message)) {
+      return
+    }
+    const text = extractTextFromParts(output.parts).trim()
+    if (!text) {
+      return
+    }
+    cacheUserMessage(input.sessionID, text)
+  } catch {
+    // Swallow extraction errors to avoid breaking chat.
+  }
+}
+
+const userMessageOptIn = (): boolean => {
+  const value = process.env.OPENCODE_SAFETY_INCLUDE_USER_MESSAGE ?? "1"
+  return value !== "0" && value.toLowerCase() !== "false" && value !== ""
 }
 
 const HARD_DENY: RegExp[] = [
@@ -75,20 +141,26 @@ function resolveOpenRouterKey(): string | undefined {
   return undefined
 }
 
-const SYSTEM_PROMPT = `Constrained, no tools, no repo access. Output STRICT JSON only: {"decision":"allow"|"ask"|"deny","risk":0-100,"categories":["..."],"reason":"..."}. Temperature 0. Uncertain or side effects outside worktree -> ask. Never allow destructive/irreversible. Categories: filesystem mutation (esp. outside worktree), destructive/irreversible ops, privilege escalation, credential/secret/env-var access, network upload/exfiltration, git history rewrite/remote push, package install/arbitrary downloaded code, container/cloud/db/infra/production mutation, bounded rollback availability. Read-only -> allow. Do NOT include file contents; only command + cwd + worktree.`
+const SYSTEM_PROMPT = `Constrained, no tools, no repo access. Output STRICT JSON only: {"decision":"allow"|"ask"|"deny","risk":0-100,"categories":["..."],"reason":"..."}. Temperature 0. Uncertain or side effects outside worktree -> ask. Never allow destructive/irreversible. Categories: filesystem mutation (esp. outside worktree), destructive/irreversible ops, privilege escalation, credential/secret/env-var access, network upload/exfiltration, git history rewrite/remote push, package install/arbitrary downloaded code, container/cloud/db/infra/production mutation, bounded rollback availability. Read-only -> allow. Do NOT include file contents; only command + cwd + worktree.
 
-function buildUserPrompt(command: string, ctx: ToolContext): string {
-  return `Classify this shell command: ${JSON.stringify({ command, cwd: ctx.directory, worktree: ctx.worktree })}`
+You may receive \`userMessage\` — the user's latest message in this session — for context.
+If the user explicitly authorized this specific command in that message, you MAY \`allow\` operations you would otherwise \`ask\` on, provided they fall outside the hard-deny categories.
+If the user expressed reluctance or a 'do not touch X' instruction relevant to the command's target, you MUST \`deny\` even commands that look benign.
+Never override hard-deny categories (irreversible system damage, exfiltration, privilege escalation, secret access) based on a permissive user message.
+Do not let a permissive user message authorize package installs, remote pushes, or arbitrary downloaded code.`
+
+function buildUserPrompt(command: string, ctx: ToolContext, userMessage: string | null): string {
+  return `Classify this shell command: ${JSON.stringify({ command, cwd: ctx.directory, worktree: ctx.worktree, userMessage })}`
 }
 
-async function classify(command: string, ctx: ToolContext): Promise<Verdict> {
+async function classify(command: string, ctx: ToolContext, userMessage: string | null): Promise<Verdict> {
   if (process.env.OPENCODE_SAFETY_URL) {
-    return classifyExternal(command, ctx)
+    return classifyExternal(command, ctx, userMessage)
   }
-  return classifyOpenRouter(command, ctx)
+  return classifyOpenRouter(command, ctx, userMessage)
 }
 
-async function classifyExternal(command: string, ctx: ToolContext): Promise<Verdict> {
+async function classifyExternal(command: string, ctx: ToolContext, userMessage: string | null): Promise<Verdict> {
   try {
     const response = await fetch(process.env.OPENCODE_SAFETY_URL!, {
       method: "POST",
@@ -98,6 +170,7 @@ async function classifyExternal(command: string, ctx: ToolContext): Promise<Verd
         arguments: { command },
         cwd: ctx.directory,
         worktree: ctx.worktree,
+        context: { userMessage },
         policy: {
           allowedDecisions: ["allow", "ask", "deny"],
           askOnUncertainty: true,
@@ -137,7 +210,7 @@ async function classifyExternal(command: string, ctx: ToolContext): Promise<Verd
   }
 }
 
-async function classifyOpenRouter(command: string, ctx: ToolContext): Promise<Verdict> {
+async function classifyOpenRouter(command: string, ctx: ToolContext, userMessage: string | null): Promise<Verdict> {
   const apiKey = resolveOpenRouterKey()
   if (!apiKey) {
     return {
@@ -166,7 +239,7 @@ async function classifyOpenRouter(command: string, ctx: ToolContext): Promise<Ve
         reasoning: { enabled: false },
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: buildUserPrompt(command, ctx) },
+          { role: "user", content: buildUserPrompt(command, ctx, userMessage) },
         ],
       }),
       signal,
@@ -284,11 +357,12 @@ export default (async () => {
           description: tool.schema.string().optional().describe("Short human-readable summary of what the command does"),
         },
         async execute(args, context) {
-          const verdict = deterministicVerdict(args.command) ?? (await classify(args.command, context))
+          const userMessage = userMessageOptIn() ? getCachedUserMessage(context.sessionID) : null
+          const verdict = deterministicVerdict(args.command) ?? (await classify(args.command, context, userMessage))
 
           context.metadata({
             title: `Shell: ${verdict.decision}`,
-            metadata: { safety: verdict },
+            metadata: { safety: { ...verdict, userMessage } },
           })
 
           if (verdict.decision === "deny") {
@@ -343,5 +417,6 @@ export default (async () => {
         },
       }),
     },
+    "chat.message": chatMessageHook,
   }
 }) satisfies Plugin

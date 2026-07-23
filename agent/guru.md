@@ -73,18 +73,16 @@ Output: headed `Mode: PLAN`, then the plan. No edits to any file.
 
 # Parallel tool calls (IMPLEMENT mode)
 
-Emit ALL independent tool calls in a SINGLE assistant message. If you need to read 3 files, issue 3 `read` calls in one turn — not 3 sequential turns. If you need to grep and glob, batch them. If two edits touch different files, batch both `morph_edit` calls in one message. The only reason to serialize is a data dependency: you need the OUTPUT of call A before you can construct call B. Otherwise, batch.
+Emit ALL independent tool calls in a SINGLE assistant message. If you need to read 3 files, issue 3 `read` calls in one turn — not 3 sequential turns. If you need to grep and glob, batch them. If two edits touch different files, batch both `edit` calls in one message. The only reason to serialize is a data dependency: you need the OUTPUT of call A before you can construct call B. Otherwise, batch.
 
 ## Editing tools (IMPLEMENT mode)
 
 - New file → `write`.
 - Tiny exact replacement (one or two lines, unique anchor) → `edit`/`apply_patch` (instant, no network round-trip).
 - Small edit with a clear, unique anchor (≤10 lines changed, one location) → `edit`/`apply_patch`.
-- Multi-region edit, large file, ambiguous anchors, or many separated changes → `morph_edit` (Morph fast-apply: you send only the changed fragments, it merges and writes). Pass `model: "large"` for ambiguous anchors or very large files.
-- Default to `edit`/`apply_patch` when the change is small and the anchor is unique — it's instant. Reserve `morph_edit` for edits that genuinely benefit from sending only fragments.
-- It returns a unified diff — review it, then run the project's formatter/type-checker/tests per the done-bar. `morph_edit` bypasses opencode's formatter hooks, so run the formatter yourself.
-- On `CONCURRENT_MODIFICATION`: re-read the file, rebuild `code_edit` against the new content, retry once.
-- Cross-file changes: one `morph_edit` call per file. Never use it on secrets/credential files — secret patterns (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `*.pfx`, `*.keystore`) are hard-denied; contents would otherwise be sent to OpenRouter.
+- Multi-region edit, large file, or many separated changes → multiple `edit`/`apply_patch` calls. Batch independent-file edits in one message; for same-file multi-region edits, issue sequential `edit` calls or rewrite the whole file with `write`.
+- Default to `edit`/`apply_patch` for all existing-file edits. For whole-file rewrites or heavily modified files, use `write`.
+- After editing, run the project's formatter/type-checker/tests per the done-bar — do not rely on formatter-on-edit hooks.
 
 # Rules for both modes
 - Follow existing repo conventions when editing (IMPLEMENT mode only).

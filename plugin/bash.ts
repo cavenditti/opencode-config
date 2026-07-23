@@ -91,7 +91,34 @@ const HARD_DENY: RegExp[] = [
   /:\(\)\s*\{\s*:\|:&\s*\};:/,
 ]
 
-const HARD_ALLOW = /^\s*(pwd|whoami|ls(?:\s|$)|rg(?:\s|$)|git status|git diff|git log(?:\s|$))\b/i
+const SECRET_DENY = /\.(env|pem|key|pfx|keystore|netrc|npmrc)(?:\b|[."'])|id_rsa|id_ed25519|id_ecdsa|id_dsa|\.ssh\/|\.aws\/|\.gnupg|\.kube\/config|opencode.*auth\.json|\/etc\/(?:shadow|master\.passwd)/i
+
+const METACHARS = /[;&|<>$`\\()"'\n\r{}]/
+
+const SAFE_COMMANDS: RegExp[] = [
+  /^[ \t]*pwd[ \t]*$/i,
+  /^[ \t]*whoami[ \t]*$/i,
+  /^[ \t]*(?:node|bun|npm|pnpm)[ \t]+--version[ \t]*$/i,
+  /^[ \t]*git[ \t]+status(?:[ \t]+[-]+[\w-]+)*[ \t]*$/i,
+  /^[ \t]*git[ \t]+rev-parse[ \t]+[A-Za-z0-9_./-]+[ \t]*$/i,
+  /^[ \t]*git[ \t]+stash[ \t]+list[ \t]*$/i,
+  /^[ \t]*git[ \t]+branch(?:[ \t]+[-]+[av]+)*[ \t]*$/i,
+  /^[ \t]*git[ \t]+remote(?:[ \t]+-v)?[ \t]*$/i,
+  /^[ \t]*git[ \t]+config[ \t]+--get[ \t]+[A-Za-z0-9_.-]+[ \t]*$/i,
+  /^[ \t]*git[ \t]+log(?:[ \t]+(?:--oneline|--stat|--graph))?(?:[ \t]+-n[ \t]+\d+)?(?:[ \t]+[A-Za-z0-9_./^-]+)?[ \t]*$/i,
+  /^[ \t]*git[ \t]+diff(?:[ \t]+(?:--stat|--name-only))?(?:[ \t]+[A-Za-z0-9_./^-]+)?[ \t]*$/i,
+  /^[ \t]*git[ \t]+show[ \t]+[A-Za-z0-9_./:^-]+[ \t]*$/i,
+  /^[ \t]*ls(?:[ \t]+[-]+[A-Za-z]+)*(?:[ \t]+[A-Za-z0-9_./-]+)*[ \t]*$/i,
+  /^[ \t]*cat[ \t]+[A-Za-z0-9_./-]+[ \t]*$/i,
+  /^[ \t]*head(?:[ \t]+-n[ \t]+\d+)?[ \t]+[A-Za-z0-9_./-]+[ \t]*$/i,
+  /^[ \t]*tail(?:[ \t]+-n[ \t]+\d+)?[ \t]+[A-Za-z0-9_./-]+[ \t]*$/i,
+  /^[ \t]*wc(?:[ \t]+[-]+[A-Za-z]+)*[ \t]+[A-Za-z0-9_./-]+[ \t]*$/i,
+  /^[ \t]*grep[ \t]+[A-Za-z0-9_./*-]+[ \t]+[A-Za-z0-9_./-]+[ \t]*$/i,
+  /^[ \t]*rg(?:[ \t]+[-]+[A-Za-z]+)*(?:[ \t]+[A-Za-z0-9_./*-]+)*(?:[ \t]+[A-Za-z0-9_./-]+)?[ \t]*$/i,
+  /^[ \t]*file[ \t]+[A-Za-z0-9_./-]+[ \t]*$/i,
+  /^[ \t]*stat[ \t]+[A-Za-z0-9_./-]+[ \t]*$/i,
+  /^[ \t]*which[ \t]+[A-Za-z0-9_-]+[ \t]*$/i,
+]
 
 function deterministicVerdict(command: string): Verdict | undefined {
   for (const pattern of HARD_DENY) {
@@ -105,12 +132,27 @@ function deterministicVerdict(command: string): Verdict | undefined {
     }
   }
 
-  if (HARD_ALLOW.test(command)) {
+  if (SECRET_DENY.test(command)) {
     return {
-      decision: "allow",
-      risk: 5,
-      categories: ["read-only"],
-      reason: "Recognized read-only command.",
+      decision: "deny",
+      risk: 90,
+      categories: ["credential/secret-access"],
+      reason: "Command references a secret or credential file.",
+    }
+  }
+
+  if (METACHARS.test(command)) {
+    return undefined
+  }
+
+  for (const pattern of SAFE_COMMANDS) {
+    if (pattern.test(command)) {
+      return {
+        decision: "allow",
+        risk: 5,
+        categories: ["read-only"],
+        reason: "Recognized safe read-only command.",
+      }
     }
   }
 
@@ -358,7 +400,7 @@ export default (async () => {
   return {
     tool: {
       bash: tool({
-        description: "Execute a shell command after deterministic and model-based safety classification.",
+        description: "Execute a shell command after layered deterministic safety checks (hard-deny, secret-deny, metacharacter gate, safe-command allowlist) with LLM-based classification fallback.",
         args: {
           command: tool.schema.string().min(1).describe("Shell command to execute"),
           description: tool.schema.string().optional().describe("One short sentence stating WHY this command is being run and what it does; surfaced to the safety classifier as intent."),

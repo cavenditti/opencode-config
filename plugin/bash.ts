@@ -1,5 +1,5 @@
 import { tool } from "@opencode-ai/plugin"
-import type { Plugin, ToolContext } from "@opencode-ai/plugin"
+import type { Plugin, ToolContext, Config } from "@opencode-ai/plugin"
 import type { UserMessage, Part, TextPart } from "@opencode-ai/sdk"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
@@ -123,7 +123,84 @@ const SAFE_COMMANDS: RegExp[] = [
   /^[ \t]*which[ \t]+[A-Za-z0-9_-]+[ \t]*$/i,
 ]
 
-function deterministicVerdict(command: string): Verdict | undefined {
+type BashRule = { pattern: string; action: "allow" | "ask" | "deny" }
+
+let globalBashRules: BashRule[] = []
+const agentBashRules = new Map<string, BashRule[]>()
+
+function expandHome(pattern: string): string {
+  if (pattern.startsWith("~/")) return homedir() + pattern.slice(1)
+  if (pattern === "~") return homedir()
+  if (pattern.startsWith("$HOME/")) return homedir() + pattern.slice(5)
+  if (pattern.startsWith("$HOME")) return homedir() + pattern.slice(5)
+  return pattern
+}
+
+function toBashRules(value: unknown): BashRule[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return []
+  const rules: BashRule[] = []
+  for (const [pattern, action] of Object.entries(value)) {
+    if (action === "allow" || action === "ask" || action === "deny") {
+      rules.push({ pattern: expandHome(pattern), action })
+    }
+  }
+  return rules
+}
+
+function matchBashPattern(str: string, pattern: string): boolean {
+  if (str) str = str.replaceAll("\\", "/")
+  if (pattern) pattern = pattern.replaceAll("\\", "/")
+  let escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".")
+  if (escaped.endsWith(" .*")) {
+    escaped = escaped.slice(0, -3) + "( .*)?"
+  }
+  const flags = process.platform === "win32" ? "si" : "s"
+  return new RegExp("^" + escaped + "$", flags).test(str)
+}
+
+const PATTERN_UNSAFE = /[;&|><`\r\n]|\$\(/
+
+function matchBashRule(command: string, agent: string | undefined): BashRule | undefined {
+  const rules = [...globalBashRules, ...(agent ? (agentBashRules.get(agent) ?? []) : [])]
+  if (rules.length === 0) return undefined
+  if (PATTERN_UNSAFE.test(command)) return undefined
+  const trimmed = command.trim()
+  let matched: BashRule | undefined
+  for (const rule of rules) {
+    if (matchBashPattern(trimmed, rule.pattern)) matched = rule
+  }
+  if (!matched) return undefined
+  if (matched.pattern === "*" && matched.action === "ask") return undefined
+  return matched
+}
+
+function ruleVerdict(rule: BashRule): Verdict {
+  return {
+    decision: rule.action,
+    risk: rule.action === "deny" ? 85 : rule.action === "ask" ? 40 : 10,
+    categories: ["user-permission-rule"],
+    reason: `Matched permission.bash rule "${rule.pattern}": "${rule.action}".`,
+  }
+}
+
+async function configHook(cfg: Config): Promise<void> {
+  try {
+    globalBashRules = toBashRules(cfg.permission?.bash)
+    agentBashRules.clear()
+    for (const [name, agentCfg] of Object.entries(cfg.agent ?? {})) {
+      const rules = toBashRules(agentCfg?.permission?.bash)
+      if (rules.length) agentBashRules.set(name, rules)
+    }
+  } catch {
+    globalBashRules = []
+    agentBashRules.clear()
+  }
+}
+
+function hardVerdict(command: string): Verdict | undefined {
   // 1. HARD_DENY
   for (const pattern of HARD_DENY) {
     if (pattern.test(command)) {
@@ -146,6 +223,10 @@ function deterministicVerdict(command: string): Verdict | undefined {
     }
   }
 
+  return undefined
+}
+
+function fallbackVerdict(command: string): Verdict | undefined {
   // 3. METACHARS
   if (METACHARS.test(command)) {
     return undefined
@@ -464,7 +545,7 @@ export default (async () => {
   return {
     tool: {
       bash: tool({
-        description: "Execute a shell command after layered deterministic safety checks (hard-deny, secret-deny, metacharacter gate, safe-command allowlist) with LLM-based classification fallback. LLM denials auto-escalate to a stronger second-opinion model; double-deny or sensitive-category cases escalate to the user (one-shot).",
+        description: "Execute a shell command after layered deterministic safety checks (hard-deny, secret-deny, metacharacter gate, safe-command allowlist) with LLM-based classification fallback. LLM denials auto-escalate to a stronger second-opinion model; double-deny or sensitive-category cases escalate to the user (one-shot). Honors permission.bash patterns from config between the secret-deny gate and the metacharacter/classifier pipeline.",
         args: {
           command: tool.schema.string().min(1).describe("Shell command to execute"),
           description: tool.schema.string().optional().describe("One short sentence stating WHY this command is being run and what it does; surfaced to the safety classifier as intent."),
@@ -472,9 +553,13 @@ export default (async () => {
         async execute(args, context) {
           const userMessage = userMessageOptIn() ? getCachedUserMessage(context.sessionID) : null
           const intent = normalizeIntent(args.description)
+          const matchedRule = matchBashRule(args.command, context.agent)
 
           // 1. Deterministic layer — runs first. A deny here HARD-BLOCKS (throw), no escalation ever.
-          const det = deterministicVerdict(args.command)
+          const det =
+            hardVerdict(args.command) ??
+            (matchedRule ? ruleVerdict(matchedRule) : undefined) ??
+            fallbackVerdict(args.command)
           let verdict: Verdict
           let firstPass: Verdict | null = null
           let secondOpinion: Verdict | null = null
@@ -538,7 +623,7 @@ export default (async () => {
             await context.ask({
               permission: "bash",
               patterns: [args.command],
-              always: escalated ? [] : [args.command],
+              always: escalated ? [] : matchedRule && matchedRule.pattern !== "*" ? [matchedRule.pattern, args.command] : [args.command],
               metadata: {
                 command: args.command,
                 "agent-stated intent": intent ?? "(not provided)",
@@ -585,5 +670,6 @@ export default (async () => {
       }),
     },
     "chat.message": chatMessageHook,
+    config: configHook,
   }
 }) satisfies Plugin

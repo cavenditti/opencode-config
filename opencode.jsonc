@@ -8,7 +8,21 @@
   "plugin": ["./plugin/bash.ts", "./plugin/enforce.ts"],
 
   "permission": {
-    "bash": "ask",
+    // Granular bash rules, honored by plugin/bash.ts between its secret-deny
+    // gate and its metacharacter/classifier pipeline. Last matching rule wins
+    // (config order, not specificity). "*": "ask" is REQUIRED as the first key:
+    // it means "defer unmatched commands to the plugin pipeline" and keeps
+    // opencode's internal context.ask re-evaluation prompting — without it,
+    // opencode's built-in {"*":"allow"} default silently auto-approves asks.
+    "bash": {
+      "*": "ask",
+      "ctx7 *": "allow",
+      "agent-browser open *": "allow",
+      "agent-browser read *": "allow",
+      "agent-browser click *": "ask",
+      "npx skills find *": "allow",
+      "npx skills add *": "ask"
+    },
     "edit": "ask",
     "morph_edit": "allow",
     "external_directory": "deny",

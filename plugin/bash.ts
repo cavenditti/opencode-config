@@ -203,17 +203,19 @@ async function configHook(cfg: Config): Promise<void> {
 // Force-push detection — deterministic gate: unconditional history overwrites
 // always go to the user (ask), never the LLM/escalation pipeline.
 // --force-with-lease / --force-if-includes are EXCLUDED (they are safe).
-const FORCE_PUSH_RE = /\bgit\s+push\b/i
-const FORCE_WITH_LEASE_RE = /--force-with-lease\b|--force-if-includes\b/i
+const FORCE_PUSH_RE = /\bgit\b(?:\s+--?[\w-]+(?:[ =]\S+)?)*\s+push\b/i
+const FORCE_WITH_LEASE_RE = /--force-with-lease\b(=\S+)?|--force-if-includes\b(=\S+)?/gi
 const FORCE_FLAG_RE = /(?:^|\s)--force\b|(?:^|\s)-[A-Za-z]*f[A-Za-z]*\b/i
 const FORCE_REFSPEC_RE = /(?:^|\s)\+[A-Za-z0-9_]/
 const MIRROR_RE = /(?:^|\s)--mirror\b/i
-const DELETE_RE = /(?:^|\s)--delete\b|(?:^|\s):[A-Za-z0-9_]/
+const DELETE_RE = /(?:^|\s)--delete\b|(?:^|\s):[A-Za-z0-9_]|(?:^|\s)-[A-Za-z]*d[A-Za-z]*\b/i
 
 function forcePushVerdict(command: string): Verdict | undefined {
   if (!FORCE_PUSH_RE.test(command)) return undefined
-  if (FORCE_WITH_LEASE_RE.test(command)) return undefined
-  if (FORCE_FLAG_RE.test(command) || FORCE_REFSPEC_RE.test(command) || MIRROR_RE.test(command) || DELETE_RE.test(command)) {
+  // Strip lease tokens so --force --force-with-lease is caught (--force wins in git).
+  // After stripping, --force-with-lease --force becomes just --force, which triggers the gate.
+  const stripped = command.replace(FORCE_WITH_LEASE_RE, "")
+  if (FORCE_FLAG_RE.test(stripped) || FORCE_REFSPEC_RE.test(stripped) || MIRROR_RE.test(stripped) || DELETE_RE.test(stripped)) {
     return {
       decision: "ask",
       risk: 75,
@@ -648,7 +650,7 @@ export default (async () => {
             await context.ask({
               permission: "bash",
               patterns: [args.command],
-              always: escalated ? [] : matchedRule && matchedRule.pattern !== "*" ? [matchedRule.pattern, args.command] : [args.command],
+              always: (escalated || verdict.categories.includes("git-history-rewrite")) ? [] : matchedRule && matchedRule.pattern !== "*" ? [matchedRule.pattern, args.command] : [args.command],
               metadata: {
                 command: args.command,
                 "agent-stated intent": intent ?? "(not provided)",

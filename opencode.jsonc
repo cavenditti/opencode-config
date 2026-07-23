@@ -21,7 +21,9 @@
       "agent-browser read *": "allow",
       "agent-browser click *": "ask",
       "npx skills find *": "allow",
-      "npx skills add *": "ask"
+      "npx skills add *": "ask",
+      "npx ctx7 *": "allow",
+      "npm i -g *": "ask"
     },
     "edit": "ask",
     "morph_edit": "allow",

@@ -7,8 +7,8 @@ Carlo's personal global configuration for [opencode](https://opencode.ai), kept 
 | Path | Description |
 |------|-------------|
 | `opencode.jsonc` | main config (model, default agent, schema) |
-| `agent/` | custom subagents (orchestrator, coder, reviewer, guru) |
-| `plugin/` | guarded bash tool: deterministic checks + DS4-flash classifier with GLM-5.2 deny-escalation |
+| `agent/` | custom subagents (orchestrator, coder, reviewer, guru, researcher, browser-reader, browser-operator, web-debugger, crawler, toolsmith) |
+| `plugin/` | guarded bash tool: deterministic checks + DS4-flash classifier with GLM-5.2 deny-escalation; `plugin/bash.ts` permission integration |
 | `tools/` | custom tools (`morph_edit` — Morph fast-apply editor) |
 | `package.json` | plugin dependencies |
 | `pnpm-lock.yaml` | lockfile (pnpm is the package manager) |
@@ -90,6 +90,54 @@ Optimistic hash; multi-agent work on the same file should use separate git workt
 ### Install note
 
 No new dependencies (`pnpm install` unchanged); restart opencode after the config change so the tool is loaded.
+
+## Web tooling stack
+
+Six specialist agents handle web research, browser interaction, debugging, crawling, and capability discovery. The orchestrator exposes `researcher` and `browser-reader` routinely; the others are delegated explicitly.
+
+### Agents
+
+| Agent | Model | Tools | Purpose |
+|---|---|---|---|
+| `researcher` | deepseek-v4-flash | `websearch`, `webfetch`, Context7 CLI | Documentation and information gathering |
+| `browser-reader` | deepseek-v4-flash | `agent-browser` read/navigation | Rendered pages, authenticated reading, screenshots |
+| `browser-operator` | deepseek-v4-flash | Full `agent-browser`, side effects gated | Forms, clicks, downloads, account interactions |
+| `web-debugger` | deepseek-v4-flash | Chrome DevTools MCP | Frontend debugging and performance |
+| `crawler` | deepseek-v4-flash | Firecrawl | Multi-page structured extraction |
+| `toolsmith` | deepseek-v4-flash | `find-skills`, package inspection | Discover and install new capabilities |
+
+### Permission model
+
+The custom `bash` plugin (`plugin/bash.ts`) honors `permission.bash` granular rules from `opencode.jsonc` between its secret-deny gate and its metacharacter/classifier pipeline. The precedence ladder is:
+
+1. **HARD_DENY** (non-overridable) — irreversible system damage
+2. **SECRET_DENY** (non-overridable) — credential/secret file access
+3. **PATTERN_UNSAFE guard** — compound commands (`;`, `&`, `|`, `>`, `<`, backtick, `$(`, newlines) skip pattern matching
+4. **`permission.bash` patterns** — user config, last-match-wins; `"*": "ask"` means "defer to plugin pipeline"
+5. **METACHARS** — shell metacharacters route to classifier
+6. **PATH_GATE / SAFE_COMMANDS** — read-only allowlist
+7. **LLM classifier** — deepseek-v4-flash via OpenRouter, with GLM-5.2 second-opinion escalation
+
+To add a new granular bash rule, add a key-value pair to the `bash` object in `opencode.jsonc`. Rules are evaluated in insertion order with last-match-wins. The `"*": "ask"` catch-all must remain the first key — it means "defer unmatched commands to the plugin's SAFE_COMMANDS + classifier pipeline" and prevents opencode's internal `{"*":"allow"}` default from silently auto-approving.
+
+### Setup
+
+Install the external tools:
+
+```bash
+npm install -g agent-browser
+agent-browser install
+npx ctx7 setup --opencode
+npx skills add vercel-labs/agent-browser -a opencode
+```
+
+Enable Exa search (optional, for enhanced web search):
+
+```bash
+export OPENCODE_ENABLE_EXA=1
+```
+
+Restart opencode after installing tools or changing config — the plugin's `config` hook fires once at startup.
 
 ## Notes
 

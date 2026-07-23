@@ -4,7 +4,6 @@ mode: subagent
 model: openrouter/deepseek/deepseek-v4-flash
 permission:
   edit: deny
-  morph_edit: deny
   bash: ask
   websearch: allow
   webfetch: allow

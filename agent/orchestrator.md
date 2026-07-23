@@ -4,7 +4,6 @@ mode: primary
 model: openrouter/z-ai/glm-5.2
 permission:
   edit: deny
-  morph_edit: deny
   bash: ask
 ---
 

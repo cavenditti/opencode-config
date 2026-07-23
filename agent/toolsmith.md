@@ -4,7 +4,6 @@ mode: subagent
 model: openrouter/deepseek/deepseek-v4-flash
 permission:
   edit: allow
-  morph_edit: allow
   bash: ask
   task: deny
 ---

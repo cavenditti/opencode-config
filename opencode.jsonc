@@ -26,7 +26,6 @@
       "npm i -g *": "ask"
     },
     "edit": "ask",
-    "morph_edit": "allow",
     "external_directory": "deny",
     "task": "ask"
   }

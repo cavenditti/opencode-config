@@ -10,7 +10,7 @@
 import type { Event } from "@opencode-ai/sdk"
 import type { EvidenceEvent, EvidenceEventType, ActorReference, Origin, RepositoryContext, MemoryScope } from "./domain.ts"
 import { eventId } from "./domain.ts"
-import { redactPayload, classifySensitivity, capturePolicyFor } from "./redaction.ts"
+import { redactPayload, classifySensitivity, capturePolicyFor, redactStringInline } from "./redaction.ts"
 
 export interface CaptureCtx {
   instanceId: string
@@ -54,7 +54,7 @@ function makeEvent(
     actor,
     origin,
     repository: ctx.gitCtx,
-    summary: truncate(summary, 400),
+    summary: redactStringInline(truncate(summary, 400)),
     payload: redacted.payload as Record<string, unknown> | undefined,
     sensitivity,
     redaction: redacted.result,

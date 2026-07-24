@@ -30,6 +30,7 @@ import {
 } from "./domain.ts"
 import { buildMemoryRecord } from "./store.ts"
 import { captureGitState, repositoryId } from "./git.ts"
+import { redactPayload, classifySensitivity, capturePolicyFor } from "./redaction.ts"
 
 export interface ProposeInput {
   kind: MemoryKind
@@ -271,6 +272,10 @@ export class MemoryGateway {
   async checkpoint(input: CheckpointInput, sessionId: string, actor: ActorReference): Promise<{ enqueued: boolean }> {
     // Enqueue a priority extraction batch by creating a synthetic event.
     const seq = this.journal.nextSequence(sessionId)
+    const rawPayload: Record<string, unknown> = { reason: input.reason, summary: input.summary, importantEventIds: input.importantEventIds }
+    const redacted = redactPayload(rawPayload)
+    const sensitivity = classifySensitivity(redacted.payload)
+    const capturePolicy = capturePolicyFor("checkpoint.requested", "interactive_agent", sensitivity)
     const event: EvidenceEvent = {
       id: "evt_cp_" + sessionId + "_" + seq,
       schemaVersion: 1,
@@ -282,10 +287,10 @@ export class MemoryGateway {
       actor,
       origin: "interactive_agent",
       summary: input.summary ?? `checkpoint: ${input.reason}`,
-      payload: { reason: input.reason, summary: input.summary, importantEventIds: input.importantEventIds },
-      sensitivity: "internal",
-      redaction: { applied: false, fieldCount: 0, patterns: [] },
-      capturePolicy: { memoryCapture: true, extractionEligible: true, retentionClass: "permanent" },
+      payload: redacted.payload as Record<string, unknown> | undefined,
+      sensitivity,
+      redaction: redacted.result,
+      capturePolicy,
     }
     this.journal.append(event)
     this.journal.touchEligible(sessionId)
@@ -368,7 +373,12 @@ export class MemoryGateway {
     let records = this.store.getMany(ids)
     // If backend underperformed, supplement with local FTS (handles pending/excluded).
     if (records.length < limit) {
-      const local = this.store.ftsSearch(query, limit * 2)
+      let local: { record: MemoryRecord; rank: number }[] = []
+      try {
+        local = this.store.ftsSearch(query, limit * 2)
+      } catch {
+        local = []
+      }
       for (const { record } of local) {
         if (!records.find((r) => r.id === record.id)) {
           records.push(record)

@@ -118,7 +118,7 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
     },
     async execute(args, context) {
       const scope = await resolveScope(context)
-      const actor = actorRef(context.agent.startsWith("reviewer") || context.agent.includes("review") ? "reviewer" : "agent", context.agent)
+      const actor = actorRef(isReviewer(config, context.agent) ? "reviewer" : "agent", context.agent)
       const result = await gateway.propose({
         kind: args.kind as never,
         statement: args.statement,
@@ -244,7 +244,7 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
       // extracted. The extractor actor id is "memory-worker"; reviewer agents
       // are distinct, so this is enforced structurally, but guard explicitly.
       const existing = await gateway.get(args.memoryId, { includeEvidence: false, includeHistory: true })
-      if (existing && existing.record.source.actor.id === context.agent && args.decision === "approve") {
+      if (existing && existing.record.source.actor.id === context.agent && (args.decision === "approve" || args.decision === "edit_and_approve")) {
         return { title: "Denied", output: "Cannot approve your own extracted output; escalate to a different reviewer or human." }
       }
       const res = await gateway.review({

@@ -192,7 +192,7 @@ export function scopeCompatible(current: MemoryScope, candidate: MemoryScope): b
     if (candidate.commitTo && current.commitFrom > candidate.commitTo) return false
   }
   // Session-scoped candidate: only within that session unless caller broadens.
-  if (candidate.sessionId && current.sessionId && candidate.sessionId !== current.sessionId) {
+  if (candidate.sessionId && candidate.sessionId !== current.sessionId) {
     return false
   }
   return true

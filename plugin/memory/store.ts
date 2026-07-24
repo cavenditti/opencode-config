@@ -210,15 +210,20 @@ export class MemoryStore {
   ftsSearch(query: string, limit: number): { record: MemoryRecord; rank: number }[] {
     const terms = normalizeStatement(query).split(" ").filter((t) => t.length > 1)
     if (terms.length === 0) return []
-    const ftsQuery = terms.map((t) => t.replace(/["'*]/g, "")).join(" ")
-    const rows = this.db.prepare(
-      `SELECT m.*, f.rank FROM memory_fts f JOIN memories m ON m.id = f.memory_id
-       WHERE memory_fts MATCH ? ORDER BY f.rank LIMIT ?`,
-    ).all(ftsQuery, limit) as Record<string, unknown>[]
-    return rows.map((r) => {
-      const { rank, ...mem } = r
-      return { record: rowToMemory(mem as Record<string, unknown>), rank: -Math.abs(rank as number) }
-    })
+    const ftsQuery = terms.map((t) => t.replace(/["'*]/g, "").replace(/[()[\]{}:^"]/g, "")).filter((t) => t.length > 1).join(" ")
+    if (ftsQuery.length === 0) return []
+    try {
+      const rows = this.db.prepare(
+        `SELECT m.*, f.rank FROM memory_fts f JOIN memories m ON m.id = f.memory_id
+         WHERE memory_fts MATCH ? ORDER BY f.rank LIMIT ?`,
+      ).all(ftsQuery, limit) as Record<string, unknown>[]
+      return rows.map((r) => {
+        const { rank, ...mem } = r
+        return { record: rowToMemory(mem as Record<string, unknown>), rank: -Math.abs(rank as number) }
+      })
+    } catch {
+      return []
+    }
   }
 
   // ── Reviews ──────────────────────────────────────────────────────────────

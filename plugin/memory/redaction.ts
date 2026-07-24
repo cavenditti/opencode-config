@@ -29,7 +29,7 @@ const PATTERNS: { name: string; re: RegExp }[] = [
   { name: "github-app", re: /\b(ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b/ },
   { name: "google-api", re: /\bAIza[0-9A-Za-z_-]{30,}\b/ },
   { name: "aws-access", re: /\bAKIA[0-9A-Z]{16}\b/ },
-  { name: "aws-secret", re: /\b[A-Za-z0-9/+=]{40}\b/ },
+  { name: "aws-secret", re: /\bAKIA[0-9A-Z]{16}[\s\S]{0,200}?[A-Za-z0-9/+=]{40}\b/ },
   { name: "pem-private-key", re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/ },
   { name: "postgres-conn", re: /postgres(?:ql)?:\/\/[^\s:@/]+:[^\s@/]+@[^\s/]+/i },
   { name: "mysql-conn", re: /mysql:\/\/[^\s:@/]+:[^\s@/]+@[^\s/]+/i },

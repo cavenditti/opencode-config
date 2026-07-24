@@ -24,3 +24,32 @@ For version-specific docs, use `/org/project/version` from the `library` output 
 
 If a command fails with a quota error, inform the user and suggest `npx ctx7@latest login` or setting `CONTEXT7_API_KEY` env var for higher limits. Do not silently fall back to training data.
 <!-- context7 -->
+
+## Shared memory
+
+Use shared memory selectively. The memory subsystem captures evidence automatically and lets you propose durable knowledge.
+
+At the start of a substantial task, call `memory_context` with a description of what you're about to do. It returns ranked, scope-filtered memories with trust levels and any unresolved contradictions.
+
+Propose a memory (`memory_propose`) when you discover a durable:
+- requirement,
+- decision,
+- verified fact,
+- reusable procedure,
+- important lesson,
+- or unresolved contradiction.
+
+Do not store:
+- transient implementation details,
+- unsupported assumptions,
+- secrets,
+- raw chain-of-thought,
+- or information already represented accurately in the codebase.
+
+When current evidence conflicts with memory, challenge the existing memory (`memory_challenge`) rather than silently overwriting or ignoring it.
+
+Before handing off or completing a substantial task, create a memory checkpoint (`memory_checkpoint`).
+
+Use `memory_search` for deliberate inspection when `memory_context` didn't return enough. Use `memory_get` to inspect a specific memory's provenance and review history.
+
+Memory is scoped: repository memories don't leak into unrelated projects. Branch-scoped observations stay branch-scoped. Pending candidates are excluded from default context until reviewed.

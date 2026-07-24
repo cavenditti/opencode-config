@@ -3,10 +3,18 @@ import type { Plugin, ToolContext } from "@opencode-ai/plugin"
 import type { Part, TextPart, UserMessage } from "@opencode-ai/sdk"
 import { Parser } from "htmlparser2"
 import TurndownService from "turndown"
+import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import {
+  PermissionRetryGate,
+  retryEpoch,
+  type RetryContext,
+  type RetryIdentity,
+  type RetryStatus,
+} from "./permission-gate/index.ts"
 import {
   gateUrl,
   normalizeUrl,
@@ -29,7 +37,7 @@ const CLASSIFIER_MODEL = "deepseek/deepseek-v4-flash"
 const IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 
-type CachedUserMessage = { text: string; ts: number }
+type CachedUserMessage = { text: string; ts: number; messageID?: string }
 type SafetyRecord = {
   url: string
   decision: Verdict["decision"]
@@ -37,9 +45,12 @@ type SafetyRecord = {
   categories: string[]
   reason: string
   classifierEscalated: boolean
+  retry?: RetryStatus
+  permissionRequested?: boolean
 }
 
 const userMessageCache = new Map<string, CachedUserMessage>()
+const permissionGate = new PermissionRetryGate()
 
 function isUserRoleMessage(message: UserMessage): boolean {
   return message.role === "user"
@@ -52,7 +63,7 @@ function extractTextFromParts(parts: Part[]): string {
     .join("\n")
 }
 
-function cacheUserMessage(sessionID: string, text: string): void {
+function cacheUserMessage(sessionID: string, text: string, messageID?: string): void {
   if (!userMessageCache.has(sessionID) && userMessageCache.size >= 16) {
     let oldest: { key: string; ts: number } | undefined
     for (const [key, value] of userMessageCache) {
@@ -60,17 +71,19 @@ function cacheUserMessage(sessionID: string, text: string): void {
     }
     if (oldest) userMessageCache.delete(oldest.key)
   }
-  userMessageCache.set(sessionID, { text: text.slice(0, MAX_USER_MESSAGE_LENGTH), ts: Date.now() })
+  const previous = userMessageCache.get(sessionID)
+  if (!previous || previous.messageID !== messageID || previous.text !== text) permissionGate.resetSession(sessionID)
+  userMessageCache.set(sessionID, { text: text.slice(0, MAX_USER_MESSAGE_LENGTH), ts: Date.now(), messageID })
 }
 
 async function chatMessageHook(
-  input: { sessionID: string },
+  input: { sessionID: string; messageID?: string },
   output: { message: UserMessage; parts: Part[] },
 ): Promise<void> {
   try {
     if (!output.message || !isUserRoleMessage(output.message)) return
     const text = extractTextFromParts(output.parts).trim()
-    if (text) cacheUserMessage(input.sessionID, text)
+    if (text) cacheUserMessage(input.sessionID, text, input.messageID ?? output.message.id)
   } catch {
     // Context is best-effort and must never break chat.
   }
@@ -251,8 +264,76 @@ async function classifyUrl(
     : classifyOpenRouter(safeUrl, ctx, userMessage, intent)
 }
 
-function oneShotAsk(verdict: Verdict): boolean {
-  return verdict.categories.some((category) => /secret|credential|ssrf|internal-network|dns-resolution-failed/i.test(category))
+function getRetryContext(ctx: ToolContext): RetryContext {
+  const cached = userMessageCache.get(ctx.sessionID)
+  return {
+    sessionID: ctx.sessionID,
+    agent: ctx.agent,
+    epoch: retryEpoch(cached?.messageID, cached?.ts),
+  }
+}
+
+function permissionFamily(verdict: Verdict): string {
+  const categories = verdict.categories.join(" ")
+  if (/secret|credential/i.test(categories)) return "sensitive-query"
+  if (/ssrf|internal-network|dns-resolution-failed/i.test(categories)) return "network-boundary"
+  if (/user-permission-rule/i.test(categories)) return "configured-rule"
+  if (/classifier-unavailable/i.test(categories)) return "classifier-unavailable"
+  return "classifier"
+}
+
+function authorizationScope(normalized: NormalizedUrl, verdict: Verdict): string {
+  return `webfetch:${normalized.scheme}://${normalized.host}:${permissionFamily(verdict)}`
+}
+
+function getRetryIdentity(
+  ctx: ToolContext,
+  normalized: NormalizedUrl,
+  verdict: Verdict,
+  requestScope: string,
+): RetryIdentity {
+  return {
+    ...getRetryContext(ctx),
+    scope: `${authorizationScope(normalized, verdict)}:${requestScope}`,
+    binding: requestScope,
+  }
+}
+
+type AuthorizationMode =
+  | { kind: "standard"; requestScope: string }
+  | { kind: "permission"; requestID: string; requestScope: string; approvedScopes: Set<string> }
+
+type AuthorizationResult =
+  | { allowed: true; normalized: NormalizedUrl; safety: SafetyRecord }
+  | { allowed: false; safety: SafetyRecord; retry: RetryStatus }
+
+function deniedWebfetchResult(safety: SafetyRecord, retry: RetryStatus) {
+  const next = retry.spent
+    ? "Permission escalation was already used for this destination in the current user turn. Wait for new user instructions."
+    : retry.requestID
+      ? `Permission escalation is available. Call webfetch_request_permission with request_id ${JSON.stringify(retry.requestID)} and the same fetch arguments.`
+      : "Try a safer public source or revise the URL before retrying."
+  return {
+    title: "Web fetch not executed — permission required",
+    output: [
+      "NOT EXECUTED",
+      "",
+      `URL: ${safety.url}`,
+      `Reason: ${safety.reason}`,
+      `Risk: ${safety.risk}`,
+      `Categories: ${safety.categories.join(", ") || "unspecified"}`,
+      `Attempts: ${Math.min(retry.attempts, retry.threshold)}/${retry.threshold}`,
+      "",
+      next,
+    ].join("\n"),
+    metadata: { safety },
+  }
+}
+
+function consumeUnusedPermissionToken(mode: AuthorizationMode, context: ToolContext): void {
+  if (mode.kind !== "permission") return
+  if (permissionGate.validateContext(getRetryContext(context), mode.requestID, mode.requestScope) !== undefined) return
+  permissionGate.consumeContext(getRetryContext(context), mode.requestID, mode.requestScope)
 }
 
 async function authorizeUrl(
@@ -261,7 +342,8 @@ async function authorizeUrl(
   ctx: ToolContext,
   userMessage: string | null,
   intent: string | null,
-): Promise<{ normalized: NormalizedUrl; safety: SafetyRecord }> {
+  mode: AuthorizationMode,
+): Promise<AuthorizationResult> {
   const normalized = normalizeUrl(rawUrl)
   if (!normalized) throw new Error("Blocked by webfetch safety policy: invalid URL.")
   const safeUrl = redactUrl(normalized)
@@ -275,35 +357,57 @@ async function authorizeUrl(
       decision: "ask",
       risk: verdict.risk,
       categories: [...new Set([...verdict.categories, "classifier-deny-escalation"])],
-      reason: `Classifier denied this fetch: ${verdict.reason} Escalating to the user.`,
+      reason: `Classifier denied this fetch: ${verdict.reason} Explicit permission is required.`,
     }
   }
 
-  const safety: SafetyRecord = { url: safeUrl, ...verdict, classifierEscalated }
-  ctx.metadata({ title: `Web fetch: ${verdict.decision} — ${safeUrl}`, metadata: { safety } })
-
   if (verdict.decision === "deny") {
+    const safety: SafetyRecord = { url: safeUrl, ...verdict, classifierEscalated }
+    ctx.metadata({ title: `Web fetch: deny — ${safeUrl}`, metadata: { safety } })
     throw new Error(`Blocked by webfetch safety policy: ${verdict.reason}`)
   }
 
   if (verdict.decision === "ask") {
-    const originPattern = `${normalized.scheme}://${normalized.host}/*`
-    await ctx.ask({
-      permission: "webfetch",
-      patterns: [safeUrl],
-      always: oneShotAsk(verdict) || classifierEscalated ? [] : [originPattern],
-      metadata: {
-        url: safeUrl,
-        "agent-stated intent": intent ?? "(not provided)",
-        risk: verdict.risk,
-        categories: verdict.categories,
-        reason: verdict.reason,
-        ...(classifierEscalated ? { escalated: true } : {}),
-      },
-    })
+    const scope = authorizationScope(normalized, verdict)
+    const identity = getRetryIdentity(ctx, normalized, verdict, mode.requestScope)
+    if (mode.kind === "standard") {
+      const retry = permissionGate.record(identity)
+      const safety: SafetyRecord = { url: safeUrl, ...verdict, classifierEscalated, retry }
+      ctx.metadata({ title: `Web fetch: permission required — ${safeUrl}`, metadata: { safety } })
+      return { allowed: false, safety, retry }
+    }
+
+    if (!mode.approvedScopes.has(scope)) {
+      const invalid = permissionGate.validate(identity, mode.requestID)
+      if (invalid) throw new Error(`${invalid} Call the standard webfetch tool and follow its retry guidance.`)
+      const consumeError = permissionGate.consume(identity, mode.requestID)
+      if (consumeError) throw new Error(consumeError)
+      await ctx.ask({
+        permission: "webfetch",
+        patterns: [safeUrl],
+        always: [],
+        metadata: {
+          url: safeUrl,
+          "agent-stated intent": intent ?? "(not provided)",
+          risk: verdict.risk,
+          categories: verdict.categories,
+          reason: verdict.reason,
+          retryThresholdSatisfied: true,
+          ...(classifierEscalated ? { escalated: true } : {}),
+        },
+      })
+      mode.approvedScopes.add(scope)
+    }
   }
 
-  return { normalized, safety }
+  const safety: SafetyRecord = {
+    url: safeUrl,
+    ...verdict,
+    classifierEscalated,
+    permissionRequested: mode.kind === "permission" && verdict.decision === "ask",
+  }
+  ctx.metadata({ title: `Web fetch: ${verdict.decision} — ${safeUrl}`, metadata: { safety } })
+  return { allowed: true, normalized, safety }
 }
 
 function acceptHeader(format: "text" | "markdown" | "html"): string {
@@ -393,73 +497,119 @@ function convertHTMLToMarkdown(html: string): string {
   return service.turndown(html)
 }
 
+type WebfetchArgs = {
+  url: string
+  format: "text" | "markdown" | "html"
+  timeout?: number
+  description?: string
+}
+
+async function executeWebfetch(
+  args: WebfetchArgs,
+  context: ToolContext,
+  rules: GateRule[],
+  mode: AuthorizationMode,
+) {
+  const timeoutSeconds = Math.min(Math.max(args.timeout ?? DEFAULT_TIMEOUT_SECONDS, 0.001), MAX_TIMEOUT_SECONDS)
+  const timeoutController = new AbortController()
+  const timer = setTimeout(() => timeoutController.abort(), timeoutSeconds * 1000)
+  const signal = AbortSignal.any([timeoutController.signal, context.abort])
+  const userMessage = includeUserMessage() ? (userMessageCache.get(context.sessionID)?.text ?? null) : null
+  const intent = normalizeIntent(args.description)
+  const safety: SafetyRecord[] = []
+  let current = args.url
+  let response: Response | undefined
+
+  try {
+    for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
+      const authorization = await authorizeUrl(current, rules, context, userMessage, intent, mode)
+      if (!authorization.allowed) return deniedWebfetchResult(authorization.safety, authorization.retry)
+      safety.push(authorization.safety)
+      response = await fetchOnce(authorization.normalized.href, args.format, signal)
+
+      if (!REDIRECT_STATUSES.has(response.status)) break
+      const location = response.headers.get("location")
+      await response.body?.cancel()
+      if (!location) throw new Error(`Redirect response ${response.status} did not include a Location header`)
+      if (redirects === MAX_REDIRECTS) throw new Error(`Too many redirects (more than ${MAX_REDIRECTS})`)
+      current = new URL(location, authorization.normalized.href).href
+    }
+
+    if (!response) throw new Error("Web fetch produced no response")
+    if (!response.ok) throw new Error(`Request failed with HTTP ${response.status} ${response.statusText}`.trim())
+    const bytes = await readLimited(response)
+    const contentType = response.headers.get("content-type") ?? ""
+    const mime = contentType.split(";")[0]?.trim().toLowerCase() ?? ""
+    const finalUrl = safety.at(-1)?.url ?? redactUrl(normalizeUrl(current)!)
+    const title = `${finalUrl} (${contentType || "unknown content type"})`
+
+    if (IMAGE_MIMES.has(mime)) {
+      consumeUnusedPermissionToken(mode, context)
+      return {
+        title,
+        output: "Image fetched successfully",
+        metadata: { safety, redirects: Math.max(0, safety.length - 1) },
+        attachments: [{ type: "file" as const, mime, url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}` }],
+      }
+    }
+
+    const content = new TextDecoder().decode(bytes)
+    const output = args.format === "markdown" && contentType.includes("text/html")
+      ? convertHTMLToMarkdown(content)
+      : args.format === "text" && contentType.includes("text/html")
+        ? extractTextFromHTML(content)
+        : content
+    consumeUnusedPermissionToken(mode, context)
+    return { title, output, metadata: { safety, redirects: Math.max(0, safety.length - 1) } }
+  } catch (error) {
+    if (timeoutController.signal.aborted && !context.abort.aborted) throw new Error("Request timed out")
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+const webfetchArgs = {
+  url: tool.schema.string().min(1).describe("The URL to fetch content from"),
+  format: tool.schema.enum(["text", "markdown", "html"]).default("markdown").describe("Output format; defaults to markdown"),
+  timeout: tool.schema.number().optional().describe("Optional timeout in seconds (max 120)"),
+  description: tool.schema.string().optional().describe("One short sentence stating why this URL is being fetched"),
+}
+
+function webfetchRequestScope(args: WebfetchArgs): string {
+  const normalized = normalizeUrl(args.url)
+  return createHash("sha256")
+    .update(JSON.stringify([normalized?.href ?? args.url.trim(), args.format, args.timeout ?? DEFAULT_TIMEOUT_SECONDS]))
+    .digest("hex")
+}
+
 export default (async (_input, options = {}) => {
   const rules = loadRules(options)
   return {
     tool: {
       webfetch: tool({
-        description: "Fetch an HTTP(S) URL after deterministic SSRF/credential checks and a safety-classifier pass. Redirects are rechecked. Returns text, markdown, HTML, or supported image attachments.",
+        description: "Non-interactive HTTP(S) fetch with SSRF, credential, redirect, and classifier checks. Safe fetches run automatically. Fetches requiring permission are not executed; the denial reason and retry status are returned. Use webfetch_request_permission only after this tool returns a request_id.",
+        args: webfetchArgs,
+        execute(args, context) {
+          return executeWebfetch(args, context, rules, { kind: "standard", requestScope: webfetchRequestScope(args) })
+        },
+      }),
+      webfetch_request_permission: tool({
+        description: "Request one-shot user permission for a fetch only after webfetch has denied the destination enough times and returned a request_id. Never use proactively. Redirects and hard-deny rules are rechecked.",
         args: {
-          url: tool.schema.string().min(1).describe("The URL to fetch content from"),
-          format: tool.schema.enum(["text", "markdown", "html"]).default("markdown").describe("Output format; defaults to markdown"),
-          timeout: tool.schema.number().optional().describe("Optional timeout in seconds (max 120)"),
-          description: tool.schema.string().optional().describe("One short sentence stating why this URL is being fetched"),
+          ...webfetchArgs,
+          request_id: tool.schema.string().min(1).describe("Opaque request_id returned by the standard webfetch tool after repeated denials"),
         },
         async execute(args, context) {
-          const timeoutSeconds = Math.min(Math.max(args.timeout ?? DEFAULT_TIMEOUT_SECONDS, 0.001), MAX_TIMEOUT_SECONDS)
-          const timeoutController = new AbortController()
-          const timer = setTimeout(() => timeoutController.abort(), timeoutSeconds * 1000)
-          const signal = AbortSignal.any([timeoutController.signal, context.abort])
-          const userMessage = includeUserMessage() ? (userMessageCache.get(context.sessionID)?.text ?? null) : null
-          const intent = normalizeIntent(args.description)
-          const safety: SafetyRecord[] = []
-          let current = args.url
-          let response: Response | undefined
-
-          try {
-            for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
-              const authorization = await authorizeUrl(current, rules, context, userMessage, intent)
-              safety.push(authorization.safety)
-              response = await fetchOnce(authorization.normalized.href, args.format, signal)
-
-              if (!REDIRECT_STATUSES.has(response.status)) break
-              const location = response.headers.get("location")
-              await response.body?.cancel()
-              if (!location) throw new Error(`Redirect response ${response.status} did not include a Location header`)
-              if (redirects === MAX_REDIRECTS) throw new Error(`Too many redirects (more than ${MAX_REDIRECTS})`)
-              current = new URL(location, authorization.normalized.href).href
-            }
-
-            if (!response) throw new Error("Web fetch produced no response")
-            if (!response.ok) throw new Error(`Request failed with HTTP ${response.status} ${response.statusText}`.trim())
-            const bytes = await readLimited(response)
-            const contentType = response.headers.get("content-type") ?? ""
-            const mime = contentType.split(";")[0]?.trim().toLowerCase() ?? ""
-            const finalUrl = safety.at(-1)?.url ?? redactUrl(normalizeUrl(current)!)
-            const title = `${finalUrl} (${contentType || "unknown content type"})`
-
-            if (IMAGE_MIMES.has(mime)) {
-              return {
-                title,
-                output: "Image fetched successfully",
-                metadata: { safety, redirects: Math.max(0, safety.length - 1) },
-                attachments: [{ type: "file" as const, mime, url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}` }],
-              }
-            }
-
-            const content = new TextDecoder().decode(bytes)
-            const output = args.format === "markdown" && contentType.includes("text/html")
-              ? convertHTMLToMarkdown(content)
-              : args.format === "text" && contentType.includes("text/html")
-                ? extractTextFromHTML(content)
-                : content
-            return { title, output, metadata: { safety, redirects: Math.max(0, safety.length - 1) } }
-          } catch (error) {
-            if (timeoutController.signal.aborted && !context.abort.aborted) throw new Error("Request timed out")
-            throw error
-          } finally {
-            clearTimeout(timer)
-          }
+          const requestScope = webfetchRequestScope(args)
+          const invalid = permissionGate.validateContext(getRetryContext(context), args.request_id, requestScope)
+          if (invalid) throw new Error(`${invalid} Call the standard webfetch tool and follow its retry guidance.`)
+          return executeWebfetch(args, context, rules, {
+            kind: "permission",
+            requestID: args.request_id,
+            requestScope,
+            approvedScopes: new Set<string>(),
+          })
         },
       }),
     },

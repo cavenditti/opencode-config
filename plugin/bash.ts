@@ -4,6 +4,7 @@ import type { UserMessage, Part, TextPart } from "@opencode-ai/sdk"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { PermissionRetryGate, retryEpoch, type RetryIdentity, type RetryStatus } from "./permission-gate/index.ts"
 
 type Verdict = {
   decision: "allow" | "ask" | "deny"
@@ -15,9 +16,11 @@ type Verdict = {
 type CachedUserMessage = {
   text: string
   ts: number
+  messageID?: string
 }
 
 const userMessageCache = new Map<string, CachedUserMessage>()
+const permissionGate = new PermissionRetryGate()
 const MAX_USER_MESSAGE_CACHE_SIZE = 16
 const MAX_USER_MESSAGE_LENGTH = 1500
 const MAX_INTENT_LENGTH = 200
@@ -33,7 +36,17 @@ function getCachedUserMessage(sessionID: string): string | null {
   return entry.text.slice(0, MAX_USER_MESSAGE_LENGTH) || null
 }
 
-function cacheUserMessage(sessionID: string, text: string): void {
+function getRetryIdentity(context: ToolContext, command: string): RetryIdentity {
+  const cached = userMessageCache.get(context.sessionID)
+  return {
+    sessionID: context.sessionID,
+    agent: context.agent,
+    epoch: retryEpoch(cached?.messageID, cached?.ts),
+    scope: `bash:${command.trim()}`,
+  }
+}
+
+function cacheUserMessage(sessionID: string, text: string, messageID?: string): void {
    if (!userMessageCache.has(sessionID) && userMessageCache.size >= MAX_USER_MESSAGE_CACHE_SIZE) {
     let oldest: { key: string; ts: number } | null = null
     for (const [key, value] of userMessageCache) {
@@ -45,7 +58,9 @@ function cacheUserMessage(sessionID: string, text: string): void {
       userMessageCache.delete(oldest.key)
     }
   }
-  userMessageCache.set(sessionID, { text, ts: Date.now() })
+  const previous = userMessageCache.get(sessionID)
+  if (!previous || previous.messageID !== messageID || previous.text !== text) permissionGate.resetSession(sessionID)
+  userMessageCache.set(sessionID, { text, ts: Date.now(), messageID })
 }
 
 function isUserRoleMessage(message: UserMessage): boolean {
@@ -72,7 +87,7 @@ async function chatMessageHook(
     if (!text) {
       return
     }
-    cacheUserMessage(input.sessionID, text)
+    cacheUserMessage(input.sessionID, text, input.messageID ?? message.id)
   } catch {
     // Swallow extraction errors to avoid breaking chat.
   }
@@ -201,7 +216,7 @@ async function configHook(cfg: Config): Promise<void> {
 }
 
 // Force-push detection — deterministic gate: unconditional history overwrites
-// always go to the user (ask), never the LLM/escalation pipeline.
+// require the explicit permission flow and never enter the LLM second-opinion pipeline.
 // --force-with-lease / --force-if-includes are EXCLUDED (they are safe).
 const FORCE_PUSH_RE = /\bgit\b(?:\s+--?[\w-]+(?:[ =]\S+)?)*\s+push\b/i
 const FORCE_WITH_LEASE_RE = /--force-with-lease\b(=\S+)?|--force-if-includes\b(=\S+)?/gi
@@ -531,7 +546,7 @@ function normalizeVerdict(parsed: unknown): Verdict {
   return { decision, risk, categories, reason }
 }
 
-// Operational note: each LLM deny triggers up to 2 sequential OpenRouter calls (DS4 8s + GLM 15s = 23s worst case); OpenRouter 429s/timeouts fail-safe to ask the user.
+// Operational note: each LLM deny triggers up to 2 sequential OpenRouter calls (DS4 8s + GLM 15s = 23s worst case); OpenRouter 429s/timeouts fail-safe to a non-executed permission-required result.
 const GLM_ESCALATION_MODEL = "z-ai/glm-5.2"
 const GLM_ESCALATION_TIMEOUT_MS = 15000
 const SCARY_CATEGORY = /destructive|irreversible|secret|credential|exfiltrat|privilege/i
@@ -549,7 +564,7 @@ function applyEscalationPolicy(firstPass: Verdict, secondOpinion: Verdict): Verd
         decision: "ask",
         risk: Math.max(firstPass.risk, secondOpinion.risk),
         categories: dedupeCategories([...firstPass.categories, ...secondOpinion.categories, "escalation-degraded"]),
-        reason: `DS4-flash denied (risk ${firstPass.risk}): "${firstPass.reason}". GLM-5.2 allowed (risk ${secondOpinion.risk}) but a sensitive category was flagged; escalating to user.`,
+        reason: `DS4-flash denied (risk ${firstPass.risk}): "${firstPass.reason}". GLM-5.2 allowed (risk ${secondOpinion.risk}) but a sensitive category was flagged; explicit permission is required.`,
       }
     }
     return {
@@ -563,140 +578,187 @@ function applyEscalationPolicy(firstPass: Verdict, secondOpinion: Verdict): Verd
     decision: "ask",
     risk: Math.max(firstPass.risk, secondOpinion.risk),
     categories: dedupeCategories([...firstPass.categories, ...secondOpinion.categories, "double-deny-escalation"]),
-    reason: `DS4-flash denied (risk ${firstPass.risk}): "${firstPass.reason}". GLM-5.2 verdict (${secondOpinion.decision}, risk ${secondOpinion.risk}): "${secondOpinion.reason}". Escalating to user.`,
+    reason: `DS4-flash denied (risk ${firstPass.risk}): "${firstPass.reason}". GLM-5.2 verdict (${secondOpinion.decision}, risk ${secondOpinion.risk}): "${secondOpinion.reason}". Explicit permission is required.`,
   }
 }
 
-export default (async () => {
+type BashArgs = { command: string; description?: string }
+type BashAssessment = {
+  verdict: Verdict
+  firstPass: Verdict | null
+  secondOpinion: Verdict | null
+  escalated: boolean
+  userMessage: string | null
+  intent: string | null
+}
+
+async function assessBash(args: BashArgs, context: ToolContext): Promise<BashAssessment> {
+  const userMessage = userMessageOptIn() ? getCachedUserMessage(context.sessionID) : null
+  const intent = normalizeIntent(args.description)
+  const matchedRule = matchBashRule(args.command, context.agent)
+  const deterministic =
+    hardVerdict(args.command) ??
+    forcePushVerdict(args.command) ??
+    (matchedRule ? ruleVerdict(matchedRule) : undefined) ??
+    fallbackVerdict(args.command)
+  let verdict: Verdict
+  let firstPass: Verdict | null = null
+  let secondOpinion: Verdict | null = null
+  let escalated = false
+
+  if (deterministic) {
+    verdict = deterministic
+  } else {
+    firstPass = await classify(args.command, context, userMessage, intent)
+    verdict = firstPass
+    if (firstPass.decision === "deny") {
+      if (process.env.OPENCODE_SAFETY_URL) {
+        verdict = {
+          decision: "ask",
+          risk: firstPass.risk,
+          categories: dedupeCategories([...firstPass.categories, "external-classifier-deny-escalation"]),
+          reason: `External classifier denied (risk ${firstPass.risk}): "${firstPass.reason}". Explicit permission is required.`,
+        }
+        escalated = true
+      } else {
+        secondOpinion = await classifyOpenRouter(
+          args.command, context, userMessage, intent,
+          GLM_ESCALATION_MODEL, GLM_ESCALATION_TIMEOUT_MS, true,
+        )
+        verdict = applyEscalationPolicy(firstPass, secondOpinion)
+        if (verdict.decision === "ask") escalated = true
+      }
+    }
+  }
+  return { verdict, firstPass, secondOpinion, escalated, userMessage, intent }
+}
+
+function setBashMetadata(context: ToolContext, assessment: BashAssessment, retry?: RetryStatus): void {
+  const { verdict, firstPass, secondOpinion, escalated, userMessage, intent } = assessment
+  const fullTitle = `Shell: ${verdict.decision}${verdict.reason ? ` — ${verdict.reason}` : ""}`
+  context.metadata({
+    title: fullTitle.length > 120 ? fullTitle.slice(0, 117) + "…" : fullTitle,
+    metadata: { safety: { ...verdict, firstPass, secondOpinion, escalated, userMessage, intent, retry } },
+  })
+}
+
+function deniedBashResult(assessment: BashAssessment, retry: RetryStatus) {
+  const next = retry.spent
+    ? "Permission escalation was already used for this operation in the current user turn. Wait for new user instructions."
+    : retry.requestID
+      ? `Permission escalation is available. Call bash_request_permission with request_id ${JSON.stringify(retry.requestID)} and the exact same command.`
+      : "Revise the command or use a safer approach before retrying."
   return {
-    tool: {
-      bash: tool({
-        description: "Execute a shell command after layered deterministic safety checks (hard-deny, secret-deny, metacharacter gate, safe-command allowlist) with LLM-based classification fallback. LLM denials auto-escalate to a stronger second-opinion model; double-deny or sensitive-category cases escalate to the user (one-shot). Honors permission.bash patterns from config between the secret-deny gate and the metacharacter/classifier pipeline.",
-        args: {
-          command: tool.schema.string().min(1).describe("Shell command to execute"),
-          description: tool.schema.string().optional().describe("One short sentence stating WHY this command is being run and what it does; surfaced to the safety classifier as intent."),
+    title: "Shell command not executed — permission required",
+    output: [
+      "NOT EXECUTED",
+      "",
+      `Reason: ${assessment.verdict.reason}`,
+      `Risk: ${assessment.verdict.risk}`,
+      `Categories: ${assessment.verdict.categories.join(", ") || "unspecified"}`,
+      `Attempts: ${Math.min(retry.attempts, retry.threshold)}/${retry.threshold}`,
+      "",
+      next,
+    ].join("\n"),
+    metadata: { safety: { ...assessment.verdict, retry } },
+  }
+}
+
+async function executeCommand(args: BashArgs, context: ToolContext, assessment: BashAssessment, permissionRequested: boolean) {
+  const proc = Bun.spawn(["/bin/bash", "-lc", args.command], {
+    cwd: context.directory,
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  const onAbort = () => proc.kill()
+  context.abort.addEventListener("abort", onAbort, { once: true })
+  try {
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ])
+    const exitCode = await proc.exited
+    const parts = [stdout.trim(), stderr.trim()].filter(Boolean)
+    return {
+      title: `Shell exited ${exitCode}`,
+      output: parts.join("\n") || `(no output, exit code ${exitCode})`,
+      metadata: {
+        exitCode,
+        safety: {
+          ...assessment.verdict,
+          firstPass: assessment.firstPass,
+          secondOpinion: assessment.secondOpinion,
+          escalated: assessment.escalated,
+          permissionRequested,
         },
-        async execute(args, context) {
-          const userMessage = userMessageOptIn() ? getCachedUserMessage(context.sessionID) : null
-          const intent = normalizeIntent(args.description)
-          const matchedRule = matchBashRule(args.command, context.agent)
+      },
+    }
+  } finally {
+    context.abort.removeEventListener("abort", onAbort)
+  }
+}
 
-          // 1. Deterministic layer — runs first. A deny here HARD-BLOCKS (throw), no escalation ever.
-          const det =
-            hardVerdict(args.command) ??
-            forcePushVerdict(args.command) ??
-            (matchedRule ? ruleVerdict(matchedRule) : undefined) ??
-            fallbackVerdict(args.command)
-          let verdict: Verdict
-          let firstPass: Verdict | null = null
-          let secondOpinion: Verdict | null = null
-          let escalated = false
+const bashArgs = {
+  command: tool.schema.string().min(1).describe("Shell command to execute"),
+  description: tool.schema.string().optional().describe("One short sentence stating WHY this command is being run and what it does; surfaced to the safety classifier as intent."),
+}
 
-          if (det) {
-            verdict = det
-          } else {
-            // 2. LLM first pass (DS4-flash)
-            firstPass = await classify(args.command, context, userMessage, intent)
-            verdict = firstPass
-            // 3. Escalation ONLY on a first-pass deny
-            if (firstPass.decision === "deny") {
-              const usedExternal = !!process.env.OPENCODE_SAFETY_URL
-              if (usedExternal) {
-                // External-classifier deny — escalate to user directly, NO GLM second opinion
-                // (privacy: don't POST external-policy-denied commands to OpenRouter; policy coherence)
-                verdict = {
-                  decision: "ask",
-                  risk: firstPass.risk,
-                  categories: dedupeCategories([...firstPass.categories, "external-classifier-deny-escalation"]),
-                  reason: `External classifier denied (risk ${firstPass.risk}): "${firstPass.reason}". Escalating to user.`,
-                }
-                escalated = true
-              } else {
-                // OpenRouter/DS4 path — second opinion from GLM-5.2
-                secondOpinion = await classifyOpenRouter(
-                  args.command, context, userMessage, intent,
-                  GLM_ESCALATION_MODEL, GLM_ESCALATION_TIMEOUT_MS, true,
-                )
-                verdict = applyEscalationPolicy(firstPass, secondOpinion)
-                if (verdict.decision === "ask") escalated = true
-              }
-            }
-          }
-
-          // 4. Metadata ONCE, after escalation resolves, structured (not prose-merged)
-          const fullTitle = `Shell: ${verdict.decision}${verdict.reason ? ` — ${verdict.reason}` : ""}`
-          const title = fullTitle.length > 120 ? fullTitle.slice(0, 117) + "…" : fullTitle
-          context.metadata({
-            title,
+export default (async () => ({
+  tool: {
+    bash: tool({
+      description: "Non-interactive shell execution with layered safety checks. Safe commands run automatically. Operations requiring permission are not executed; the denial reason and retry status are returned to the calling agent. Use bash_request_permission only when this tool provides a request_id after repeated denials.",
+      args: bashArgs,
+      async execute(args, context) {
+        const assessment = await assessBash(args, context)
+        if (assessment.verdict.decision === "deny") {
+          setBashMetadata(context, assessment)
+          throw new Error(`Blocked by safety policy: ${assessment.verdict.reason}${assessment.intent ? ` (agent-stated intent: ${assessment.intent})` : ""}`)
+        }
+        if (assessment.verdict.decision === "ask") {
+          const retry = permissionGate.record(getRetryIdentity(context, args.command))
+          setBashMetadata(context, assessment, retry)
+          return deniedBashResult(assessment, retry)
+        }
+        setBashMetadata(context, assessment)
+        return executeCommand(args, context, assessment, false)
+      },
+    }),
+    bash_request_permission: tool({
+      description: "Request one-shot user permission for a shell command only after bash has denied the exact command enough times and returned a request_id. Never use proactively. The full safety policy is rechecked and hard-denied commands remain blocked.",
+      args: {
+        ...bashArgs,
+        request_id: tool.schema.string().min(1).describe("Opaque request_id returned by the standard bash tool after repeated denials"),
+      },
+      async execute(args, context) {
+        const identity = getRetryIdentity(context, args.command)
+        const invalid = permissionGate.validate(identity, args.request_id)
+        if (invalid) throw new Error(`${invalid} Call the standard bash tool and follow its retry guidance.`)
+        const assessment = await assessBash(args, context)
+        setBashMetadata(context, assessment)
+        if (assessment.verdict.decision === "deny") {
+          throw new Error(`Blocked by safety policy and cannot be escalated: ${assessment.verdict.reason}`)
+        }
+        const consumeError = permissionGate.consume(identity, args.request_id)
+        if (consumeError) throw new Error(consumeError)
+        if (assessment.verdict.decision === "ask") {
+          await context.ask({
+            permission: "bash",
+            patterns: [args.command],
+            always: [],
             metadata: {
-              safety: {
-                ...verdict,
-                firstPass,
-                secondOpinion,
-                escalated,
-                userMessage,
-                intent,
-              },
+              command: args.command,
+              "agent-stated intent": assessment.intent ?? "(not provided)",
+              risk: assessment.verdict.risk,
+              categories: assessment.verdict.categories,
+              reason: assessment.verdict.reason,
+              retryThresholdSatisfied: true,
             },
           })
-
-          // 5. Decision
-          if (verdict.decision === "deny") {
-            // ONLY deterministic hard-deny reaches here (LLM denies were converted to ask above)
-            throw new Error(`Blocked by safety policy: ${verdict.reason}${intent ? ` (agent-stated intent: ${intent})` : ""}`)
-          }
-
-          if (verdict.decision === "ask") {
-            await context.ask({
-              permission: "bash",
-              patterns: [args.command],
-              always: (escalated || verdict.categories.includes("git-history-rewrite")) ? [] : matchedRule && matchedRule.pattern !== "*" ? [matchedRule.pattern, args.command] : [args.command],
-              metadata: {
-                command: args.command,
-                "agent-stated intent": intent ?? "(not provided)",
-                risk: verdict.risk,
-                categories: verdict.categories,
-                reason: verdict.reason,
-                ...(escalated ? { escalated: true } : {}),
-              },
-            })
-          }
-
-          const proc = Bun.spawn(["/bin/bash", "-lc", args.command], {
-            cwd: context.directory,
-            stdout: "pipe",
-            stderr: "pipe",
-          })
-
-          const onAbort = () => proc.kill()
-          context.abort.addEventListener("abort", onAbort, { once: true })
-
-          try {
-            const [stdout, stderr] = await Promise.all([
-              new Response(proc.stdout).text(),
-              new Response(proc.stderr).text(),
-            ])
-            const exitCode = await proc.exited
-
-            const parts: string[] = []
-            const outTrim = stdout.trim()
-            const errTrim = stderr.trim()
-            if (outTrim) parts.push(outTrim)
-            if (errTrim) parts.push(errTrim)
-            const output = parts.join("\n")
-
-            return {
-              title: `Shell exited ${exitCode}`,
-              output: output || `(no output, exit code ${exitCode})`,
-              metadata: { exitCode, safety: { ...verdict, firstPass, secondOpinion, escalated } },
-            }
-          } finally {
-            context.abort.removeEventListener("abort", onAbort)
-          }
-        },
-      }),
-    },
-    "chat.message": chatMessageHook,
-    config: configHook,
-  }
-}) satisfies Plugin
+        }
+        return executeCommand(args, context, assessment, assessment.verdict.decision === "ask")
+      },
+    }),
+  },
+  "chat.message": chatMessageHook,
+  config: configHook,
+})) satisfies Plugin

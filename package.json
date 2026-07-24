@@ -2,10 +2,11 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test:english-guard": "node test/english-guard.test.ts",
     "test:webfetch": "node test/webfetch-gate.test.ts",
     "test:webfetch-plugin": "node test/webfetch-plugin.test.ts",
     "test:memory": "node plugin/memory/smoke.ts",
-    "test": "pnpm run typecheck && pnpm run test:webfetch && pnpm run test:webfetch-plugin && pnpm run test:memory"
+    "test": "pnpm run typecheck && pnpm run test:english-guard && pnpm run test:webfetch && pnpm run test:webfetch-plugin && pnpm run test:memory"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.4",

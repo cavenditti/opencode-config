@@ -8,7 +8,7 @@ Carlo's personal global configuration for [opencode](https://opencode.ai), kept 
 |------|-------------|
 | `opencode.jsonc` | main config (model, default agent, schema) |
 | `agent/` | custom subagents (orchestrator, coder, reviewer, guru, researcher, browser-reader, browser-operator, web-debugger, crawler, toolsmith) |
-| `plugin/` | guarded bash and webfetch tools, plus enforcement and shared-memory plugins |
+| `plugin/` | guarded bash/webfetch tools, English-language enforcement, shared memory, and task-result enforcement |
 | `test/` | tests kept outside `plugin/` so OpenCode does not auto-load them |
 | `webfetch-rules.json` | optional URL-pattern overrides for the guarded webfetch tool |
 | `package.json` | plugin dependencies |
@@ -25,6 +25,19 @@ Carlo's personal global configuration for [opencode](https://opencode.ai), kept 
 The guarded `bash` tool in `plugin/bash.ts` overrides the built-in bash tool. It first applies deterministic hard rules (hard-deny of irreversible system damage and secret/credential access — these always hard-block), then a metacharacter/path gate and a safe-command allowlist, then asks `deepseek/deepseek-v4-flash` (thinking disabled, temperature 0) via OpenRouter for the final classification. It resolves the OpenRouter API key from opencode's own auth store (`~/.local/share/opencode/auth.json`), or from `OPENROUTER_API_KEY` if set. Alternatively, set `OPENCODE_SAFETY_URL` to use an external classifier service. The fail-safe verdict is `ask`.
 
 **Deny escalation (two-model):** when the DS4-flash classifier denies a command, it auto-escalates to `z-ai/glm-5.2` for a second opinion (longer 15s timeout). If GLM-5.2 allows AND neither model flagged a sensitive category (`destructive`/`irreversible`/`secret`/`credential`/`exfiltration`/`privilege`) AND GLM's risk < 50, the command runs (override). Otherwise — GLM also denies/asks, GLM is unavailable, or a sensitive category was flagged — the command escalates to the user via a **one-shot** `ask` (no permanent allowlist). LLM denials never hard-block; only the deterministic hard-deny layer throws. When `OPENCODE_SAFETY_URL` is set, external-classifier denies escalate to the user directly without a GLM call (privacy + policy coherence). Run `pnpm install` (the plugin dependency is already declared) and restart opencode after changing the plugin or config.
+
+### English-language guard
+
+`plugin/english-guard.ts` targets GLM, DeepSeek, Qwen, Kimi/Moonshot, MiniMax, and Yi model IDs. It appends a strong English-only system rule before generation. If substantial Chinese still appears, completed assistant text is translated before it is stored, while completed reasoning parts are translated and replaced in place through OpenCode's message-part API. The translated part is what the TUI displays and what later turns receive as context. Once drift is detected, subsequent turns also receive a short English recovery instruction.
+
+OpenCode does not expose a hook for rewriting reasoning token-by-token, so Chinese may remain visible while the reasoning part is actively streaming; replacement happens when that part completes. The guard never auto-submits a synthetic “continue in English” user turn, avoiding surprise extra generations.
+
+Translation uses OpenRouter with `openai/gpt-4.1-mini`, falling back to `deepseek/deepseek-v4-flash`, and sends only parts with substantial Han text. Configure it with:
+
+- `OPENCODE_ENGLISH_GUARD_MODELS`: comma-separated model-ID substrings to target.
+- `OPENCODE_ENGLISH_GUARD_TRANSLATION_MODEL`: preferred translator model.
+- `OPENCODE_ENGLISH_GUARD_TRANSLATE=0`: keep prevention/recovery prompts but disable translation calls.
+- `OPENCODE_ENGLISH_GUARD_DEBUG=1`: log translation failures.
 
 ### Webfetch gate
 

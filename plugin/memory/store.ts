@@ -77,7 +77,7 @@ export class MemoryStore {
         confidence, trust_level, durability, valid_from, valid_until,
         supersedes_json, superseded_by, tags_json, backend_mappings_json,
         created_at, updated_at, created_by_json, reviewed_by_json, review_id
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       rec.id, rec.schemaVersion, rec.kind, rec.status, rec.statement,
       statementHash(rec.statement),
@@ -231,7 +231,7 @@ export class MemoryStore {
   createReview(review: MemoryReview): void {
     this.db.prepare(
       `INSERT INTO reviews (id, memory_id, decision, reviewer_json, rationale, edited_statement, edited_payload_json, edited_scope_json, duplicate_of, superseded_by_memory_id, escalate_to, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       review.id, review.memoryId, review.decision, JSON.stringify(review.reviewer),
       review.rationale, review.editedStatement ?? null,
@@ -265,7 +265,7 @@ export class MemoryStore {
   createConflict(conflict: MemoryConflict): void {
     this.db.prepare(
       `INSERT INTO conflicts (id, memory_ids_json, candidate_ids_json, conflict_type, status, evidence_json, resolution, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?)`,
     ).run(
       conflict.id, JSON.stringify(conflict.memoryIds), JSON.stringify(conflict.candidateIds),
       conflict.conflictType, conflict.status, JSON.stringify(conflict.evidence),

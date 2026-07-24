@@ -104,7 +104,7 @@ export class Journal {
         actor_json, origin, repository_json, summary, payload_json, payload_ref,
         sensitivity, redaction_json, capture_policy_json, processing_status,
         attempts, last_error, created_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET
         summary=excluded.summary,
         payload_json=excluded.payload_json,

@@ -3,7 +3,7 @@
   "default_agent": "build",
   "model": "openrouter/z-ai/glm-5.2",
   "small_model": "openrouter/deepseek/deepseek-v4-flash",
-  "instructions": ["AGENTS.md"],
+  "instructions": ["AGENTS.md", "prompts/implementer-common.md"],
 
   "plugin": ["./plugin/bash.ts", "./plugin/enforce.ts", "./plugin/english-guard.ts", "./plugin/memory.ts", "./plugin/webfetch.ts"],
 

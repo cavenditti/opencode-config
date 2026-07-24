@@ -29,7 +29,7 @@ If a command fails with a quota error, inform the user and suggest `npx ctx7@lat
 
 Use shared memory selectively. The memory subsystem captures evidence automatically and lets you propose durable knowledge.
 
-Memory is project-specific by default. Never broaden a proposal by overriding project, repository, workspace, or user identity. Global memory is exceptional: use `memory_approve_global` only after the user explicitly asks for cross-project sharing; the tool must obtain one-shot interactive approval for the exact memory.
+Memory is project-specific by default. Never broaden a proposal by overriding project, repository, workspace, or user identity. The only memories eligible for global storage are long-term facts, preferences, requirements, or constraints about the user in general, independent of any project. Use `memory_approve_global` only for that user-profile category and only after the user explicitly asks; the tool must obtain one-shot interactive approval for the exact statement.
 
 At the start of a substantial task, call `memory_context` with a description of what you're about to do. It returns ranked, scope-filtered memories with trust levels and any unresolved contradictions.
 

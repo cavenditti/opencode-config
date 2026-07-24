@@ -14,7 +14,7 @@ import type { ToolDefinition } from "@opencode-ai/plugin"
 import type { MemoryConfig } from "./config.ts"
 import type { MemoryGateway } from "./gateway.ts"
 import type { MemoryScope, MemoryKind, MemoryStatus } from "./domain.ts"
-import { actorRef } from "./domain.ts"
+import { actorRef, globalUserMemoryEligible } from "./domain.ts"
 
 export interface ToolDeps {
   config: MemoryConfig
@@ -103,7 +103,7 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
 
   const memory_propose = tool({
     description:
-      "Propose durable memory for the current project. Project identity cannot be overridden; session/branch/component fields may only narrow it. Use for durable requirements, decisions, verified facts, reusable procedures, important lessons, or unresolved contradictions. Never store secrets, transient details, or unsupported assumptions. Global sharing requires the separate memory_approve_global tool and explicit user permission.",
+      "Propose durable memory for the current project. Project identity cannot be overridden; session/branch/component fields may only narrow it. Use for durable requirements, decisions, verified facts, reusable procedures, important lessons, or unresolved contradictions. Never store secrets, transient details, or unsupported assumptions. Only long-term memories about the user in general can later be promoted globally, through memory_approve_global and explicit user permission.",
     args: {
       kind: schema.string().describe("fact | decision | requirement | constraint | preference | procedure | lesson | incident | hypothesis | episode | artifact | relation."),
       statement: schema.string().min(1).max(4000).describe("A single atomic, self-contained proposition. Entity-centric, under 60 words preferred."),
@@ -143,7 +143,7 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
 
   const memory_approve_global = tool({
     description:
-      "Promote one current-project memory to global user memory. This always requests one-shot interactive permission from the user for the exact memory; approval cannot be delegated to an agent or reviewer and is never remembered. Call only when the user explicitly asks to share a memory across projects.",
+      "Promote one long-term, project-independent memory about the user in general to global user-profile memory. Eligible kinds are fact, preference, requirement, and constraint. This always asks whether the exact statement describes the user generally across all projects; approval cannot be delegated or remembered. Never use for project facts, architecture, policies, procedures, or lessons.",
     args: {
       memoryId: schema.string().min(1).describe("Current-project memory to promote globally."),
       rationale: schema.string().min(1).describe("Why this memory should apply across all projects."),
@@ -152,12 +152,23 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
       const scope = await resolveScope(context)
       const existing = await gateway.getForScope(args.memoryId, scope, { includeEvidence: false, includeHistory: false })
       if (!existing) return { title: "Not found", output: "Memory is not visible in the current project." }
+      if (!globalUserMemoryEligible(existing.record)) {
+        return {
+          title: "Not eligible for global memory",
+          output: "Only long-term, project-independent facts, preferences, requirements, or constraints about the user in general may be global.",
+        }
+      }
+      if (["rejected", "superseded", "expired"].includes(existing.record.status)) {
+        return { title: "Not eligible for global memory", output: `Cannot promote ${existing.record.status} memory.` }
+      }
       await context.ask({
         permission: "memory_global",
         patterns: [args.memoryId],
         always: [],
         metadata: {
-          action: "Promote project memory to global memory",
+          action: "Save general user-profile memory globally",
+          confirmation: "Does this exact statement describe you generally, independent of any project?",
+          category: "user_profile",
           memoryId: args.memoryId,
           statement: existing.record.statement,
           sourceProjectId: scope.projectId,

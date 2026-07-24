@@ -4,6 +4,7 @@ import {
   scopeMultiplier, scopeDepth, canTransition, rankResult, defaultRankingWeights,
   validatePropose, validateCandidate, isExpired, indexEligible, recencyMultiplier,
   evidenceMultiplier, actorRef, memoryId, memoryVisibleFrom, isGlobalScope, scopeContainerTag,
+  globalUserMemoryEligible,
   type MemoryScope, type ExtractedCandidate, type MemoryRecord, type MemoryReview,
 } from "./domain.ts"
 import { loadConfig } from "./config.ts"
@@ -56,22 +57,31 @@ check("scopeCompatible rejects candidate dimensions absent from current", () => 
   assert.ok(!scopeCompatible({ userId: "u", projectId: "p" }, { userId: "u", projectId: "p", repositoryId: "r" }))
 })
 check("unapproved global memory is invisible", () => {
-  const global = { scope: { userId: "u" }, globalApproval: undefined }
+  const global = { kind: "preference" as const, durability: "long_term" as const, scope: { userId: "u" }, globalApproval: undefined }
   assert.ok(isGlobalScope(global.scope))
   assert.ok(!memoryVisibleFrom(sessionScope, global))
 })
 check("user-approved global memory is visible", () => {
   const global = {
+    kind: "preference" as const,
+    durability: "long_term" as const,
     scope: { userId: "u" },
     globalApproval: {
       approvedAt: new Date().toISOString(),
       approvedBy: actorRef("user", "u"),
       method: "interactive_permission" as const,
+      category: "user_profile" as const,
       rationale: "shared convention",
       sourceProjectId: "p",
     },
   }
   assert.ok(memoryVisibleFrom(sessionScope, global))
+})
+check("global eligibility only accepts general long-term user-profile kinds", () => {
+  assert.ok(globalUserMemoryEligible({ kind: "preference", durability: "long_term", scope: { projectId: "p" } }))
+  assert.ok(!globalUserMemoryEligible({ kind: "decision", durability: "long_term", scope: { projectId: "p" } }))
+  assert.ok(!globalUserMemoryEligible({ kind: "fact", durability: "project", scope: { projectId: "p" } }))
+  assert.ok(!globalUserMemoryEligible({ kind: "fact", durability: "long_term", scope: { projectId: "p", branch: "main" } }))
 })
 check("scopeMultiplier narrowest > broadest", () => {
   const mSession = scopeMultiplier(sessionScope, sessionScope)
@@ -304,6 +314,7 @@ const scopeA: MemoryScope = { userId: "u", projectId: "project-a", repositoryId:
 const scopeB: MemoryScope = { userId: "u", projectId: "project-b", repositoryId: "repo", branch: "main", sessionId: "sb" }
 const proposer = actorRef("agent", "coder")
 let projectMemoryId = ""
+let userProfileMemoryId = ""
 
 await checkAsync("proposal defaults to project scope and persists structured payload", async () => {
   const result = await gateway.propose({
@@ -330,6 +341,21 @@ await checkAsync("proposal cannot override project identity", async () => {
     confidence: 0.8,
     durability: "project",
   }, proposer, scopeA), /cannot override current projectId/)
+})
+
+await checkAsync("general user-profile memory remains project-scoped until approval", async () => {
+  const result = await gateway.propose({
+    kind: "preference",
+    statement: "The user generally prefers concise technical explanations",
+    scope: {},
+    confidence: 1,
+    durability: "long_term",
+  }, proposer, scopeA)
+  userProfileMemoryId = result.memoryId
+  const record = fakeStore.get(result.memoryId)!
+  assert.ok(globalUserMemoryEligible(record))
+  assert.equal(record.scope.projectId, "project-a")
+  assert.equal(await gateway.getForScope(result.memoryId, scopeB), null)
 })
 
 await checkAsync("same statement in another project is not deduplicated or readable by id", async () => {
@@ -412,19 +438,27 @@ await checkAsync("legacy unapproved global records stay quarantined", async () =
   assert.ok(!indexEligible(fakeStore.get(legacy.id)!))
 })
 
-await checkAsync("only a user actor can promote a project memory globally", async () => {
-  await assert.rejects(() => gateway.promoteGlobal(projectMemoryId, scopeA, proposer, "agent attempt"), /explicit user approval/)
-  const promoted = await gateway.promoteGlobal(projectMemoryId, scopeA, actorRef("user", "u"), "Applies to every project")
+await checkAsync("project decisions cannot be promoted globally", async () => {
+  await assert.rejects(
+    () => gateway.promoteGlobal(projectMemoryId, scopeA, actorRef("user", "u"), "Applies to every project"),
+    /only long-term, project-independent/,
+  )
+})
+
+await checkAsync("only a user actor can promote eligible user-profile memory globally", async () => {
+  await assert.rejects(() => gateway.promoteGlobal(userProfileMemoryId, scopeA, proposer, "agent attempt"), /explicit user approval/)
+  const promoted = await gateway.promoteGlobal(userProfileMemoryId, scopeA, actorRef("user", "u"), "This describes the user generally")
   assert.ok(promoted.globalApproval)
+  assert.equal(promoted.globalApproval?.category, "user_profile")
   assert.equal(promoted.scope.projectId, undefined)
-  assert.ok(await gateway.getForScope(projectMemoryId, scopeB))
+  assert.ok(await gateway.getForScope(userProfileMemoryId, scopeB))
   assert.ok(indexEligible(promoted))
 })
 
 await checkAsync("reviewers cannot edit an approved global statement", async () => {
   const reviewCount = fakeStore.reviews.length
   await assert.rejects(() => gateway.review({
-    memoryId: projectMemoryId,
+    memoryId: userProfileMemoryId,
     decision: "edit_and_approve",
     rationale: "attempted edit",
     editedStatement: "Changed global statement",
@@ -436,7 +470,7 @@ check("backend containers separate projects from approved globals", () => {
   assert.equal(containerTagFor(gatewayConfig, scopeA), `${gatewayConfig.backend.containerTagPrefix}:${scopeContainerTag(scopeA)}`)
   assert.equal(containerTagFor(gatewayConfig, { userId: "u" }), `${gatewayConfig.backend.containerTagPrefix}:${scopeContainerTag({ userId: "u" })}`)
   assert.notEqual(scopeContainerTag(scopeA), scopeContainerTag(scopeB))
-  const promoted = fakeStore.get(projectMemoryId)!
+  const promoted = fakeStore.get(userProfileMemoryId)!
   assert.equal(indexableFrom(promoted).containerTag, undefined)
 })
 

@@ -63,42 +63,24 @@ Classification output is a 3-field record recorded in the ledger per task-id: `{
 ## 8. Dispatch policy
 
 - Routing per the decision table.
-- Spec format passed to every implementer: Goal (one sentence) / Files (touch + read-for-context) / Change (precise) / Constraints (conventions, NOT-to-touch) / Done-criteria **+ task id (Tn) + criticality + the global done-bar (verbatim, §9) + the commit protocol (verbatim, §11)**.
+- Spec format passed to every implementer: Goal (one sentence) / Files (touch + read-for-context) / Change (precise) / Constraints (conventions, NOT-to-touch) / Done-criteria + task id (`Tn`) + criticality. The shared implementer protocol is inherited; do not duplicate it in dispatches.
 - Status-block escalation: `Confidence: low` OR `Spec issues` ≠ none OR `Status: BLOCKED` → escalate one tier (coder→guru; guru→surface to user) with the status block attached.
 - Per-dispatch budget: ~30 turns / ~10 min wall-clock. On exhaustion: escalate or surface to the user.
 - Batch 3–5 `task` calls in a single message when tasks are independent (bounded by the conflict-closure test, §12).
-- **Parallel tool calls**: emit ALL independent tool calls (reads, greps, globs, edits, task dispatches) in a SINGLE assistant message whenever they have no data dependency on each other's outputs. Do not serialize reads or searches one-per-turn — batch them. This is the single biggest latency lever.
 
-## 9. Global done-bar (verbatim — auto-append to EVERY implementer spec)
+## 9. Shared implementer completion protocol
 
-> Before reporting: (1) Discover and run the repo's build, typecheck, lint, and test commands (check package.json scripts, Makefile, CI config). Report each command and its exit code. (2) If no such tooling exists for the files you changed, run the closest available check and state exactly what you ran; if none exists, say so and give substitute evidence. (3) Never weaken, delete, or skip existing tests/checks to make them pass. (4) Leave no new TODO/FIXME/placeholder in your diff. (5) If a check fails and you cannot fix it within the spec's scope, stop and report `Status: BLOCKED` with the failing output.
+The done-bar and implementer output contract are inherited from `prompts/implementer-common.md`; dispatches reference that canonical definition without copying it.
 
 ## 10. Status block + handling rules
 
-The implementer's ENTIRE final message is this block:
-
-```
-Status: DONE | DONE-WITH-CONCERNS | BLOCKED
-Confidence: high | medium | low
-Spec issues: none | <what is wrong or missing in the spec>
-Deviations: none | <what you did differently and why>
-Files: <comma-separated paths actually modified>
-Verification: <command → exit code, one per line, or "none: <reason>">
-Commit: <full SHA> | none
-Warnings: none | <anything the orchestrator or user should know>
-```
-
-Handling: keep the block VERBATIM in the ledger; discard everything else from the implementer's reply. (Replaces the old "summarize in 1–2 lines" rule.)
+The implementer's entire final message is the inherited Status block. Keep it verbatim in the ledger and discard everything else.
 
 **`[enforce]` warning handling** (from plugin/enforce.ts): if a task result contains an `[enforce]` warning, treat it as DONE-WITH-CONCERNS — missing status markers → re-issue the output-format instruction via `task_id` resume or escalate one tier; commit/Files mismatch → flag for priority reviewer attention. The plugin is defense-in-depth and fails open; the reviewer is the authoritative backstop.
 
-## 11. Commit protocol (verbatim)
+## 11. Shared commit protocol
 
-- Spec assigns a logical task id (`Tn`). Commit message: `task(Tn): <imperative one-line summary>`.
-- Stage by explicit pathspec ONLY: `git add <path1> <path2> …` — EXACTLY the files in `Files:`. NEVER `git add -A`, `git add .`, or `git add -u`.
-- On `index.lock` contention: sleep 2s, retry, max 3.
-- Record the batch base SHA (`git rev-parse HEAD`) in the ledger before dispatching.
-- If a commit is denied/fails: implementer reports `Commit: none` + Warnings; reviewer then diffs the working tree against the recorded base SHA; orchestrator flags the broken commit chain to the user in one line.
+The commit rules are inherited from `prompts/implementer-common.md`. The orchestrator records the batch base SHA before dispatch and uses the inherited commit fields during review.
 
 ## 12. Parallelism
 

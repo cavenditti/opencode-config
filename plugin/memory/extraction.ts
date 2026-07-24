@@ -54,7 +54,8 @@ Hard rules:
 - scope must reflect WHERE the claim holds: set repositoryId/branch/sessionId from the evidence when the claim is tied to that context; omit fields that don't apply.
 - confidence is 0..1: how well the evidence supports THIS claim.
 - importance: low/medium/high based on reuse value.
-- reviewRecommendation: "auto_observational" for bounded deterministic facts (a command exited 0, a test failed with error X, a file changed); "auto_accept" only for explicit user requirements clearly stated in a user message; "agent_review" for inferred procedures/lessons/decisions; "human_review" for global preferences or security policy.
+- All extracted candidates remain project-scoped. Never infer or request global scope. Only an explicit interactive user action may later promote a long-term memory about the user in general.
+- reviewRecommendation: "auto_observational" for bounded deterministic facts (a command exited 0, a test failed with error X, a file changed); "auto_accept" only for explicit user requirements clearly stated in a user message; "agent_review" for inferred procedures/lessons/decisions; "human_review" for general user-profile preferences or security policy.
 Output JSON ONLY. No prose, no markdown fences.`
 
 const OUTPUT_SCHEMA = {

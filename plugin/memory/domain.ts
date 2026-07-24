@@ -126,6 +126,7 @@ export interface GlobalMemoryApproval {
   approvedAt: string
   approvedBy: ActorReference
   method: "interactive_permission"
+  category: "user_profile"
   rationale: string
   sourceProjectId: string
 }
@@ -180,6 +181,20 @@ export function isProjectScope(scope: MemoryScope): boolean {
 
 export function isGlobalScope(scope: MemoryScope): boolean {
   return !isProjectScope(scope)
+}
+
+const GLOBAL_USER_MEMORY_KINDS = new Set<MemoryKind>(["fact", "preference", "requirement", "constraint"])
+
+/** Structural eligibility for a project memory that describes the user in
+ * general. The interactive approval remains the semantic check that the exact
+ * statement is genuinely about the user rather than the current project. */
+export function globalUserMemoryEligible(record: Pick<MemoryRecord, "kind" | "durability" | "scope">): boolean {
+  if (!GLOBAL_USER_MEMORY_KINDS.has(record.kind) || record.durability !== "long_term") return false
+  return !(
+    record.scope.branch || record.scope.worktreeId || record.scope.commitFrom ||
+    record.scope.commitTo || record.scope.component || record.scope.environment ||
+    record.scope.sessionId
+  )
 }
 
 export function scopeDepth(scope: MemoryScope): number {
@@ -352,12 +367,13 @@ export interface MemoryRecord {
  * created them. Project-less records are global and stay invisible until a
  * user explicitly approves promotion through an interactive permission.
  */
-export function memoryVisibleFrom(current: MemoryScope, record: Pick<MemoryRecord, "scope" | "globalApproval">): boolean {
+export function memoryVisibleFrom(current: MemoryScope, record: Pick<MemoryRecord, "scope" | "globalApproval" | "kind" | "durability">): boolean {
   if (isProjectScope(record.scope)) {
     if (!current.projectId || record.scope.projectId !== current.projectId) return false
     return scopeCompatible(current, record.scope)
   }
-  if (!record.globalApproval || record.globalApproval.approvedBy.kind !== "user") return false
+  if (!record.globalApproval || record.globalApproval.approvedBy.kind !== "user" || record.globalApproval.category !== "user_profile") return false
+  if (!globalUserMemoryEligible(record)) return false
   return scopeCompatible(current, record.scope)
 }
 
@@ -738,7 +754,12 @@ export function isExpired(record: MemoryRecord, now: number = Date.now()): boole
 }
 
 export function indexEligible(record: MemoryRecord, includePending: boolean = false): boolean {
-  if (isGlobalScope(record.scope) && (!record.globalApproval || record.globalApproval.approvedBy.kind !== "user")) {
+  if (isGlobalScope(record.scope) && (
+    !record.globalApproval ||
+    record.globalApproval.approvedBy.kind !== "user" ||
+    record.globalApproval.category !== "user_profile" ||
+    !globalUserMemoryEligible(record)
+  )) {
     return false
   }
   if (record.status === "approved") return true

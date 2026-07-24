@@ -27,6 +27,7 @@ import {
   reviewId, conflictId, statementHash, normalizeStatement,
   validatePropose, validateCandidate, scopeCompatible, memoryVisibleFrom,
   rankResult, defaultRankingWeights, isExpired, indexEligible, isGlobalScope, canTransition,
+  globalUserMemoryEligible,
 } from "./domain.ts"
 import { buildMemoryRecord } from "./store.ts"
 import { captureGitState, repositoryId } from "./git.ts"
@@ -661,6 +662,9 @@ export class MemoryGateway {
     if (record.status === "rejected" || record.status === "superseded" || record.status === "expired") {
       throw new Error(`cannot promote ${record.status} memory`)
     }
+    if (!globalUserMemoryEligible(record)) {
+      throw new Error("only long-term, project-independent facts, preferences, requirements, or constraints about the user may become global")
+    }
     if (!await this.removeBackendMappings(record)) {
       throw new Error("global promotion could not safely remove the project-scoped backend copy; retry later")
     }
@@ -673,6 +677,7 @@ export class MemoryGateway {
         approvedAt: new Date().toISOString(),
         approvedBy: approver,
         method: "interactive_permission",
+        category: "user_profile",
         rationale,
         sourceProjectId: scope.projectId,
       },

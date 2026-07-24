@@ -29,6 +29,7 @@ export interface MemoryConfig {
     processOnCompaction: boolean
     processOnCommit: boolean
     pollIntervalSeconds: number
+    maxAttempts: number
   }
   extraction: {
     provider: "openrouter" | "external"
@@ -123,6 +124,9 @@ export function loadConfig(raw?: Record<string, unknown>): MemoryConfig {
       processOnCompaction: batchingOpts.processOnCompaction !== false,
       processOnCommit: batchingOpts.processOnCommit !== false,
       pollIntervalSeconds: typeof batchingOpts.pollIntervalSeconds === "number" ? batchingOpts.pollIntervalSeconds : 30,
+      maxAttempts: typeof batchingOpts.maxAttempts === "number" && Number.isFinite(batchingOpts.maxAttempts)
+        ? Math.max(1, Math.floor(batchingOpts.maxAttempts))
+        : 3,
     },
     extraction: {
       provider: extractionOpts.provider === "external" ? "external" : "openrouter",
@@ -146,7 +150,7 @@ export function loadConfig(raw?: Record<string, unknown>): MemoryConfig {
         : ["memory-reviewer", "reviewer"],
       ordinaryAgentTools: Array.isArray(reviewOpts.ordinaryAgentTools)
         ? (reviewOpts.ordinaryAgentTools as string[])
-        : ["memory_context", "memory_search", "memory_get", "memory_propose", "memory_relate", "memory_challenge", "memory_checkpoint"],
+        : ["memory_context", "memory_search", "memory_get", "memory_propose", "memory_approve_global", "memory_relate", "memory_challenge", "memory_checkpoint"],
     },
     backend: {
       type: backendType,

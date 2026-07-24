@@ -104,12 +104,21 @@ function failOpen(rt: Runtime, label: string, error: unknown, ev?: { id: string;
   }
 }
 
+function enforceGlobalPermission(input: { type: string }, output: { status: "ask" | "deny" | "allow" }): void {
+  if (input.type === "memory_global" && output.status === "allow") output.status = "ask"
+}
+
 export default (async ({ directory, worktree, project }, options) => {
   const opts = (options ?? {}) as Record<string, unknown>
   const rt = await initRuntime(opts)
   if (!rt.config.enabled) {
     return {
-      tool: buildTools({ config: rt.config, gateway: rt.gateway, resolveScope: async (c) => rt.gateway.resolveScope(c) }),
+      tool: buildTools({
+        config: rt.config,
+        gateway: rt.gateway,
+        resolveScope: async (c) => rt.gateway.resolveScope({ ...c, sessionId: c.sessionID }),
+      }),
+      async "permission.ask"(input, output) { enforceGlobalPermission(input, output) },
     }
   }
 
@@ -140,7 +149,7 @@ export default (async ({ directory, worktree, project }, options) => {
       config: rt.config,
       gateway: rt.gateway,
       resolveScope: async (c) => {
-        const { scope } = await ensureScope(c.sessionId ?? "")
+        const { scope } = await ensureScope(c.sessionID ?? "")
         // Overlay caller-provided fields (directory/worktree) by re-resolving if needed.
         return scope
       },
@@ -180,7 +189,7 @@ export default (async ({ directory, worktree, project }, options) => {
           evidence.sequence = rt.journal.nextSequence(effectiveSessionId)
           evidence.sessionId = effectiveSessionId
           rt.journal.append(evidence)
-          rt.journal.touchEligible(effectiveSessionId)
+          if (evidence.capturePolicy.extractionEligible) rt.journal.touchEligible(effectiveSessionId)
         } catch (error) {
           failOpen(rt, "journal.append", error, evidence)
           return
@@ -206,6 +215,10 @@ export default (async ({ directory, worktree, project }, options) => {
       } catch (error) {
         failOpen(rt, "event.hook", error)
       }
+    },
+
+    async "permission.ask"(input, output) {
+      enforceGlobalPermission(input, output)
     },
 
     async "tool.execute.after"(input, _output) {

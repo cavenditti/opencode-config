@@ -47,6 +47,7 @@ function rowToMemory(row: Record<string, unknown>): MemoryRecord {
     createdBy: JSON.parse(row.created_by_json as string),
     reviewedBy: row.reviewed_by_json ? JSON.parse(row.reviewed_by_json as string) : undefined,
     reviewId: (row.review_id ?? undefined) as string | undefined,
+    globalApproval: row.global_approval_json ? JSON.parse(row.global_approval_json as string) : undefined,
   }
 }
 
@@ -76,8 +77,9 @@ export class MemoryStore {
         structured_payload_json, scope_json, source_json, evidence_json,
         confidence, trust_level, durability, valid_from, valid_until,
         supersedes_json, superseded_by, tags_json, backend_mappings_json,
-        created_at, updated_at, created_by_json, reviewed_by_json, review_id
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        created_at, updated_at, created_by_json, reviewed_by_json, review_id,
+        global_approval_json
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       rec.id, rec.schemaVersion, rec.kind, rec.status, rec.statement,
       statementHash(rec.statement),
@@ -88,6 +90,7 @@ export class MemoryStore {
       rec.backendMappings ? JSON.stringify(rec.backendMappings) : null,
       rec.createdAt, rec.updatedAt, JSON.stringify(rec.createdBy),
       rec.reviewedBy ? JSON.stringify(rec.reviewedBy) : null, rec.reviewId ?? null,
+      rec.globalApproval ? JSON.stringify(rec.globalApproval) : null,
     )
     this.indexFts(rec)
   }
@@ -130,7 +133,7 @@ export class MemoryStore {
         scope_json=?, evidence_json=?, confidence=?, trust_level=?,
         valid_from=?, valid_until=?, supersedes_json=?, superseded_by=?,
         tags_json=?, backend_mappings_json=?, updated_at=?,
-        reviewed_by_json=?, review_id=?
+        reviewed_by_json=?, review_id=?, global_approval_json=?
        WHERE id = ?`,
     ).run(
       next.status, next.statement, statementHash(next.statement),
@@ -140,7 +143,9 @@ export class MemoryStore {
       JSON.stringify(next.supersedes), next.supersededBy ?? null, JSON.stringify(next.tags),
       next.backendMappings ? JSON.stringify(next.backendMappings) : null,
       next.updatedAt, next.reviewedBy ? JSON.stringify(next.reviewedBy) : null,
-      next.reviewId ?? null, id,
+      next.reviewId ?? null,
+      next.globalApproval ? JSON.stringify(next.globalApproval) : null,
+      id,
     )
     this.indexFts(next)
     return next
@@ -347,6 +352,7 @@ export class MemoryStore {
 export function buildMemoryRecord(input: {
   kind: MemoryKind
   statement: string
+  structuredPayload?: Record<string, unknown>
   scope: MemoryScope
   source: MemoryRecord["source"]
   evidence: EvidenceReference[]
@@ -366,6 +372,7 @@ export function buildMemoryRecord(input: {
     kind: input.kind,
     status: "pending",
     statement: input.statement.trim(),
+    structuredPayload: input.structuredPayload,
     scope: input.scope,
     source: input.source,
     evidence: input.evidence,

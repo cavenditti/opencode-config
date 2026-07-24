@@ -14,7 +14,7 @@ import type { Journal, EventRow } from "./journal.ts"
 import type { MemoryStore } from "./store.ts"
 import type { BackendRegistry, BackendRecordReference } from "./backend.ts"
 import {
-  indexWithFallback,
+  containerTagFor, indexWithFallback, indexableFrom,
   type BackendSearchQuery, type BackendSearchResult,
 } from "./backend.ts"
 import {
@@ -25,12 +25,12 @@ import {
   type ExtractedCandidate, type SessionCapsuleSummary, type MemorySource,
   type EvidenceEvent, type SessionCapsule,
   reviewId, conflictId, statementHash, normalizeStatement,
-  validatePropose, validateCandidate, scopeCompatible,
-  rankResult, defaultRankingWeights, isExpired, indexEligible, scopeDepth,
+  validatePropose, validateCandidate, scopeCompatible, memoryVisibleFrom,
+  rankResult, defaultRankingWeights, isExpired, indexEligible, isGlobalScope, canTransition,
 } from "./domain.ts"
 import { buildMemoryRecord } from "./store.ts"
 import { captureGitState, repositoryId } from "./git.ts"
-import { redactPayload, classifySensitivity, capturePolicyFor } from "./redaction.ts"
+import { redactPayload, classifySensitivity, capturePolicyFor, containsSecret } from "./redaction.ts"
 
 export interface ProposeInput {
   kind: MemoryKind
@@ -98,6 +98,7 @@ export class MemoryGateway {
     sessionId?: string
     userId?: string
     agent?: string
+    projectId?: string
   }): Promise<MemoryScope> {
     const scope: MemoryScope = {
       userId: input.userId ?? process.env.USER ?? "default",
@@ -114,14 +115,15 @@ export class MemoryGateway {
         scope.worktreeId = input.worktree
       }
     }
-    scope.projectId = input.worktree ?? dir
+    scope.projectId = input.projectId ?? input.worktree ?? dir
     return scope
   }
 
   // ── Explicit propose ──────────────────────────────────────────────────────
 
-  async propose(input: ProposeInput, actor: ActorReference, scope: MemoryScope): Promise<ProposeResult> {
-    const scopeResolved = { ...scope, ...input.scope } as MemoryScope
+  async propose(input: ProposeInput, actor: ActorReference, scope: MemoryScope, sourceOverride?: MemorySource): Promise<ProposeResult> {
+    this.assertSafeMemoryInput(input)
+    const scopeResolved = this.resolveProjectScope(input, scope)
     const issues = validatePropose({ ...input, scope: scopeResolved })
     if (issues.length) {
       throw new Error(`invalid propose: ${issues.map((i) => i.field + ": " + i.message).join("; ")}`)
@@ -132,7 +134,7 @@ export class MemoryGateway {
     // Duplicate detection: exact hash within a compatible scope.
     for (const mem of existing) {
       if (mem.status === "rejected" || mem.status === "superseded") continue
-      if (scopeCompatible(scopeResolved, mem.scope) && normalizeStatement(mem.statement) === normalizeStatement(input.statement)) {
+      if (memoryVisibleFrom(scopeResolved, mem) && normalizeStatement(mem.statement) === normalizeStatement(input.statement)) {
         return {
           memoryId: mem.id,
           status: mem.status,
@@ -144,12 +146,13 @@ export class MemoryGateway {
       }
     }
 
-    const source: MemorySource = {
+    const source: MemorySource = sourceOverride ?? {
       type: "explicit",
       origin: actor.kind === "reviewer" ? "memory_reviewer" : "interactive_agent",
       actor,
     }
     const trustLevel: TrustLevel =
+      source.origin === "memory_extractor" ? "automatically_extracted" :
       actor.kind === "user" ? "user_asserted" :
       actor.kind === "reviewer" ? "reviewer_approved" :
       "agent_proposed"
@@ -157,6 +160,7 @@ export class MemoryGateway {
     let record = buildMemoryRecord({
       kind: input.kind,
       statement: input.statement,
+      structuredPayload: input.structuredPayload,
       scope: scopeResolved,
       source,
       evidence: input.evidence ?? [],
@@ -188,6 +192,52 @@ export class MemoryGateway {
     }
   }
 
+  private assertSafeMemoryInput(input: Pick<ProposeInput, "statement" | "structuredPayload" | "evidence" | "tags" | "reason">): void {
+    if (containsSecret(input.statement)) throw new Error("memory statement contains secret material or a secret-file path")
+    const extra = redactPayload({
+      structuredPayload: input.structuredPayload,
+      evidence: input.evidence,
+      tags: input.tags,
+      reason: input.reason,
+    })
+    if (extra.result.applied) throw new Error("memory metadata contains secret material or a secret-file path")
+  }
+
+  private resolveProjectScope(input: ProposeInput, current: MemoryScope): MemoryScope {
+    if (!current.projectId) throw new Error("cannot create memory without a resolved project")
+    const requested = input.scope ?? {}
+    const fixed: (keyof MemoryScope)[] = [
+      "userId", "organizationId", "workspaceId", "projectId",
+      "repositoryId", "repositoryRemote",
+    ]
+    for (const key of fixed) {
+      if (requested[key] != null && requested[key] !== current[key]) {
+        throw new Error(`memory scope cannot override current ${key}`)
+      }
+    }
+    const scope: MemoryScope = {}
+    for (const key of fixed) {
+      if (current[key] != null) (scope as Record<string, unknown>)[key] = current[key]
+    }
+    const bounded: (keyof MemoryScope)[] = ["branch", "worktreeId", "commitFrom", "commitTo", "sessionId"]
+    for (const key of bounded) {
+      const value = requested[key]
+      if (value == null) continue
+      const currentValue = key === "commitTo" ? current.commitFrom : current[key]
+      if (currentValue !== value) {
+        throw new Error(`memory scope cannot claim a different ${key}`)
+      }
+      ;(scope as Record<string, unknown>)[key] = value
+    }
+    if (input.durability === "session") {
+      if (!current.sessionId) throw new Error("session memory requires a current session")
+      scope.sessionId = current.sessionId
+    }
+    if (typeof requested.component === "string") scope.component = requested.component
+    if (typeof requested.environment === "string") scope.environment = requested.environment
+    return scope
+  }
+
   private autoAcceptDecision(record: MemoryRecord, reason?: string): { accept: boolean; status?: MemoryStatus; trustLevel?: TrustLevel; reason: string } {
     const c = this.config.review
     // Observational: bounded facts about a specific event.
@@ -195,7 +245,7 @@ export class MemoryGateway {
       return { accept: true, status: "observational", reason: "auto-accepted as observational" }
     }
     // User-asserted requirements.
-    if (c.autoAcceptUserRequirements && record.kind === "requirement" && record.trustLevel === "user_asserted" && scopeDepth(record.scope) > 1) {
+    if (c.autoAcceptUserRequirements && record.kind === "requirement" && record.trustLevel === "user_asserted" && !!record.scope.projectId) {
       return { accept: true, status: "approved", reason: "auto-accepted user requirement" }
     }
     // Repository-verified deterministic facts.
@@ -203,7 +253,7 @@ export class MemoryGateway {
       return { accept: true, status: "approved", reason: "auto-accepted repository-verified fact" }
     }
     // Global user preferences require human review.
-    if (c.requireHumanForGlobalPreferences && record.kind === "preference" && scopeDepth(record.scope) <= 1) {
+    if (c.requireHumanForGlobalPreferences && record.kind === "preference" && isGlobalScope(record.scope)) {
       return { accept: false, reason: "global preference requires human review" }
     }
     return { accept: false, reason: "pending agent/human review" }
@@ -213,13 +263,20 @@ export class MemoryGateway {
     return (
       record.kind === "fact" &&
       record.durability !== "long_term" &&
+      !!record.scope.sessionId &&
       (record.evidence.some((e) => e.eventId) || record.source.origin === "system")
     )
   }
 
   // ── Relate ──────────────────────────────────────────────────────────────
 
-  async relate(subjectId: string, predicate: RelationKind, objectId: string, evidence: EvidenceReference[], confidence: number, actor: ActorReference): Promise<{ id: string }> {
+  async relate(subjectId: string, predicate: RelationKind, objectId: string, evidence: EvidenceReference[], confidence: number, actor: ActorReference, scope: MemoryScope): Promise<{ id: string }> {
+    const subject = this.store.get(subjectId)
+    const object = this.store.get(objectId)
+    if (!subject || !object) throw new Error("relation endpoints must be existing memories")
+    if (!memoryVisibleFrom(scope, subject) || !memoryVisibleFrom(scope, object)) {
+      throw new Error("relation endpoints are outside the current project scope")
+    }
     const id = "rel_" + subjectId.slice(4, 12) + "_" + objectId.slice(4, 12) + "_" + predicate
     this.store.upsertRelation(id, subjectId, predicate, objectId, evidence, confidence)
     return { id }
@@ -230,6 +287,7 @@ export class MemoryGateway {
   async challenge(input: ChallengeInput, actor: ActorReference, scope: MemoryScope): Promise<{ challengeMemoryId?: string; conflictId: string }> {
     const target = this.store.get(input.memoryId)
     if (!target) throw new Error(`memory not found: ${input.memoryId}`)
+    if (!memoryVisibleFrom(scope, target)) throw new Error("memory is outside the current project scope")
     // Mark target challenged (does not delete).
     if (target.status === "approved" || target.status === "observational" || target.status === "pending") {
       this.store.update(input.memoryId, { status: "challenged" })
@@ -338,6 +396,12 @@ export class MemoryGateway {
     return { record, evidence, reviews, conflicts }
   }
 
+  async getForScope(memoryId_: string, scope: MemoryScope, opts: { includeEvidence?: boolean; includeHistory?: boolean } = {}): ReturnType<MemoryGateway["get"]> {
+    const record = this.store.get(memoryId_)
+    if (!record || !memoryVisibleFrom(scope, record)) return Promise.resolve(null)
+    return this.get(memoryId_, opts)
+  }
+
   private async assemble(query: string, scope: MemoryScope, opts: {
     kinds?: MemoryKind[]
     statuses?: MemoryStatus[]
@@ -351,7 +415,7 @@ export class MemoryGateway {
 
     const backendQuery: BackendSearchQuery = {
       query,
-      scopes: [scope],
+      scopes: [scope, ...(scope.userId ? [{ userId: scope.userId }] : [])],
       limit: limit * 2,
       threshold: this.config.retrieval.semanticThreshold,
       includePending,
@@ -399,7 +463,7 @@ export class MemoryGateway {
       if (record.status === "rejected" || record.status === "superseded" || record.status === "expired") continue
       if (isExpired(record)) continue
       // Scope compatibility.
-      if (!scopeCompatible(scope, record.scope)) continue
+      if (!memoryVisibleFrom(scope, record)) continue
       if (opts.kinds && opts.kinds.length && !opts.kinds.includes(record.kind)) continue
       const conflicts = this.store.openConflictsFor([record.id])
       const score = rankResult(
@@ -476,17 +540,35 @@ export class MemoryGateway {
 
   // ── Reviewer workflow ────────────────────────────────────────────────────
 
-  async listPending(limit: number = 50, kind?: MemoryKind): Promise<MemoryRecord[]> {
-    return this.store.list({ status: "pending", kind, limit })
+  async listPending(scope: MemoryScope, limit: number = 50, kind?: MemoryKind): Promise<MemoryRecord[]> {
+    return this.store.list({ status: "pending", kind, limit: limit * 4 })
+      .filter((record) => memoryVisibleFrom(scope, record))
+      .slice(0, limit)
   }
 
-  async listChallenged(limit: number = 50): Promise<MemoryRecord[]> {
-    return this.store.list({ status: "challenged", limit })
+  async listChallenged(scope: MemoryScope, limit: number = 50): Promise<MemoryRecord[]> {
+    return this.store.list({ status: "challenged", limit: limit * 4 })
+      .filter((record) => memoryVisibleFrom(scope, record))
+      .slice(0, limit)
   }
 
-  async review(input: ReviewInput, reviewer: ActorReference): Promise<{ memoryId: string; status: MemoryStatus }> {
+  async review(input: ReviewInput, reviewer: ActorReference, scope: MemoryScope): Promise<{ memoryId: string; status: MemoryStatus }> {
     const record = this.store.get(input.memoryId)
     if (!record) throw new Error(`memory not found: ${input.memoryId}`)
+    if (!memoryVisibleFrom(scope, record)) throw new Error("memory is outside the current project scope")
+    this.assertSafeMemoryInput({ statement: input.rationale })
+    if (isGlobalScope(record.scope) && (input.editedStatement || input.editedPayload || input.editedScope)) {
+      throw new Error("editing global memory requires a new project proposal and explicit user promotion")
+    }
+    if (input.editedStatement || input.editedPayload) {
+      this.assertSafeMemoryInput({
+        statement: input.editedStatement ?? record.statement,
+        structuredPayload: input.editedPayload,
+      })
+    }
+    if (!["approve", "reject", "edit_and_approve", "duplicate", "supersede", "escalate"].includes(input.decision)) {
+      throw new Error(`unsupported review decision: ${input.decision}`)
+    }
     const now = new Date().toISOString()
     const review: MemoryReview = {
       id: reviewId(),
@@ -502,27 +584,38 @@ export class MemoryGateway {
       escalateTo: input.escalateTo,
       createdAt: now,
     }
-    this.store.createReview(review)
-
     let newStatus: MemoryStatus = record.status
     let patch: Partial<MemoryRecord> = { reviewedBy: reviewer, reviewId: review.id }
     switch (input.decision) {
       case "approve":
         newStatus = "approved"
-        patch.trustLevel = "reviewer_approved"
+        if (!isGlobalScope(record.scope)) patch.trustLevel = "reviewer_approved"
         break
       case "edit_and_approve":
         newStatus = "approved"
         patch.trustLevel = "reviewer_approved"
         if (input.editedStatement) patch.statement = input.editedStatement
         if (input.editedPayload) patch.structuredPayload = input.editedPayload
-        if (input.editedScope) patch.scope = { ...record.scope, ...input.editedScope }
+        if (input.editedScope) {
+          patch.scope = this.resolveProjectScope({
+            kind: record.kind,
+            statement: input.editedStatement ?? record.statement,
+            scope: input.editedScope,
+            confidence: record.confidence,
+            durability: record.durability,
+          }, scope)
+        }
         break
       case "reject":
         newStatus = "rejected"
         break
       case "duplicate":
         if (input.duplicateOf) {
+          const duplicate = this.store.get(input.duplicateOf)
+          if (!duplicate || !memoryVisibleFrom(scope, duplicate)) throw new Error("duplicate target is outside the current project scope")
+          if (isGlobalScope(record.scope) !== isGlobalScope(duplicate.scope) || record.scope.projectId !== duplicate.scope.projectId) {
+            throw new Error("cannot deduplicate across project/global boundaries")
+          }
           newStatus = "superseded"
           patch.supersededBy = input.duplicateOf
           patch.supersedes = [...record.supersedes]
@@ -531,6 +624,14 @@ export class MemoryGateway {
         }
         break
       case "supersede":
+        if (!input.supersededByMemoryId) throw new Error("supersede decision requires supersededByMemoryId")
+        if (input.supersededByMemoryId) {
+          const replacement = this.store.get(input.supersededByMemoryId)
+          if (!replacement || !memoryVisibleFrom(scope, replacement)) throw new Error("replacement is outside the current project scope")
+          if (isGlobalScope(record.scope) !== isGlobalScope(replacement.scope) || record.scope.projectId !== replacement.scope.projectId) {
+            throw new Error("cannot supersede across project/global boundaries")
+          }
+        }
         newStatus = "superseded"
         if (input.supersededByMemoryId) patch.supersededBy = input.supersededByMemoryId
         break
@@ -538,63 +639,159 @@ export class MemoryGateway {
         newStatus = record.status
         break
     }
+    if (newStatus !== record.status && !canTransition(record.status, newStatus)) {
+      throw new Error(`invalid transition ${record.status} -> ${newStatus} for ${record.id}`)
+    }
+    this.store.createReview(review)
     const updated = this.store.update(input.memoryId, { ...patch, status: newStatus })
-    if (updated) void this.indexMemory(updated)
+    if (updated) await this.indexMemory(updated)
     return { memoryId: input.memoryId, status: newStatus }
   }
 
+  async promoteGlobal(memoryId_: string, scope: MemoryScope, approver: ActorReference, rationale: string): Promise<MemoryRecord> {
+    if (approver.kind !== "user") throw new Error("global promotion requires an explicit user approval")
+    if (!scope.projectId) throw new Error("global promotion requires a current project")
+    this.assertSafeMemoryInput({ statement: rationale })
+    const record = this.store.get(memoryId_)
+    if (!record || !memoryVisibleFrom(scope, record)) throw new Error("memory is outside the current project scope")
+    if (isGlobalScope(record.scope)) {
+      if (!record.globalApproval) throw new Error("legacy global memory must first be recreated in this project")
+      return record
+    }
+    if (record.status === "rejected" || record.status === "superseded" || record.status === "expired") {
+      throw new Error(`cannot promote ${record.status} memory`)
+    }
+    if (!await this.removeBackendMappings(record)) {
+      throw new Error("global promotion could not safely remove the project-scoped backend copy; retry later")
+    }
+    const promoted = this.store.update(memoryId_, {
+      scope: { userId: scope.userId ?? "default" },
+      status: "approved",
+      trustLevel: "user_asserted",
+      reviewedBy: approver,
+      globalApproval: {
+        approvedAt: new Date().toISOString(),
+        approvedBy: approver,
+        method: "interactive_permission",
+        rationale,
+        sourceProjectId: scope.projectId,
+      },
+      backendMappings: [],
+    })
+    if (!promoted) throw new Error(`memory not found: ${memoryId_}`)
+    await this.indexMemory(promoted)
+    return promoted
+  }
+
   async supersede(memoryId_: string, replacement: ProposeInput, reviewer: ActorReference, scope: MemoryScope): Promise<{ original: MemoryStatus; replacementId: string }> {
+    const target = this.store.get(memoryId_)
+    if (!target || !memoryVisibleFrom(scope, target)) throw new Error("memory is outside the current project scope")
+    if (isGlobalScope(target.scope)) throw new Error("global replacement requires a new project proposal and explicit user promotion")
+    if (!canTransition(target.status, "superseded")) throw new Error(`cannot supersede ${target.status} memory`)
     const result = await this.propose(replacement, reviewer, scope)
     const updated = this.store.update(memoryId_, {
       status: "superseded",
       supersededBy: result.memoryId,
       reviewedBy: reviewer,
     })
-    if (updated) void this.indexMemory(updated)
-    // Remove the superseded memory from the index; the replacement is indexed on propose.
-    const original = this.store.get(memoryId_)
-    if (original?.backendMappings) {
-      for (const m of original.backendMappings) {
-        void this.registry.primary.remove(m).catch(() => {})
-      }
-    }
+    if (updated) await this.indexMemory(updated)
     return { original: "superseded", replacementId: result.memoryId }
   }
 
-  async mergeDuplicates(keepId: string, dropIds: string[], reviewer: ActorReference): Promise<{ merged: number }> {
+  async mergeDuplicates(keepId: string, dropIds: string[], reviewer: ActorReference, scope: MemoryScope): Promise<{ merged: number }> {
     const keep = this.store.get(keepId)
     if (!keep) throw new Error(`keep memory not found: ${keepId}`)
+    if (!memoryVisibleFrom(scope, keep)) throw new Error("keeper is outside the current project scope")
+    const drops: MemoryRecord[] = []
     for (const dropId of dropIds) {
       const drop = this.store.get(dropId)
       if (!drop) continue
+      if (!memoryVisibleFrom(scope, drop)) throw new Error(`duplicate ${dropId} is outside the current project scope`)
+      if (isGlobalScope(keep.scope) !== isGlobalScope(drop.scope) || keep.scope.projectId !== drop.scope.projectId) {
+        throw new Error("cannot merge memories across project/global boundaries")
+      }
+      if (!canTransition(drop.status, "superseded")) throw new Error(`cannot merge ${drop.status} memory ${dropId}`)
+      drops.push(drop)
+    }
+    let merged = 0
+    let mergedEvidence = [...keep.evidence]
+    for (const drop of drops) {
       // Merge evidence into keep.
-      const mergedEvidence = [...keep.evidence, ...drop.evidence]
+      mergedEvidence = [...mergedEvidence, ...drop.evidence]
       this.store.update(keepId, { evidence: mergedEvidence, reviewedBy: reviewer })
-      this.store.update(dropId, {
+      this.store.update(drop.id, {
         status: "superseded",
         supersededBy: keepId,
         reviewedBy: reviewer,
       })
       if (drop.backendMappings) {
-        for (const m of drop.backendMappings) {
-          void this.registry.primary.remove(m).catch(() => {})
-        }
+        if (await this.removeBackendMappings(drop)) this.store.setBackendMapping(drop.id, [])
       }
+      merged++
     }
-    return { merged: dropIds.length }
+    const updatedKeep = this.store.get(keepId)
+    if (updatedKeep) await this.indexMemory(updatedKeep)
+    return { merged }
   }
 
   // ── Indexing helper ────────────────────────────────────────────────────────
 
   private async indexMemory(record: MemoryRecord): Promise<void> {
-    if (!indexEligible(record, this.config.backend.indexPending)) return
+    if (!indexEligible(record, this.config.backend.indexPending)) {
+      if (await this.removeBackendMappings(record)) this.store.setBackendMapping(record.id, [])
+      return
+    }
     try {
-      const ref = await indexWithFallback(this.registry, record, () => {
-        this.store.setBackendMapping(record.id, [])
-      })
+      const expectedContainer = this.registry.type === "supermemory"
+        ? containerTagFor(this.config, record.scope)
+        : undefined
+      let mapping = record.backendMappings?.find((item) => item.backend === this.registry.type)
+      if (mapping && expectedContainer && mapping.containerTag !== expectedContainer) {
+        try { await this.registry.primary.remove(mapping) } catch { return }
+        mapping = undefined
+      }
+      const ref = mapping
+        ? await this.registry.primary.update(mapping, indexableFrom(record))
+        : await indexWithFallback(this.registry, record)
       this.store.setBackendMapping(record.id, [{ backend: ref.backend, backendId: ref.backendId, containerTag: ref.containerTag, indexedAt: new Date().toISOString() }])
     } catch {
-      this.store.setBackendMapping(record.id, [])
+      // The canonical store remains authoritative. Keep the prior mapping so
+      // a later lifecycle update can retry or remove it instead of leaking it.
+    }
+  }
+
+  private async removeBackendMappings(record: MemoryRecord): Promise<boolean> {
+    let removedAll = true
+    for (const mapping of record.backendMappings ?? []) {
+      const backend = mapping.backend === this.registry.type
+        ? this.registry.primary
+        : mapping.backend === "local"
+          ? this.registry.fallback
+          : undefined
+      if (!backend) {
+        removedAll = false
+        continue
+      }
+      try { await backend.remove(mapping) } catch { removedAll = false }
+    }
+    return removedAll
+  }
+
+  /** Retry incomplete lifecycle cleanup and move legacy mappings into the
+   * current project/global container without re-updating healthy records. */
+  async maintainIndexes(limit: number = 500): Promise<void> {
+    const records = this.store.list({ limit })
+    for (const record of records) {
+      const eligible = indexEligible(record, this.config.backend.indexPending)
+      const mapping = record.backendMappings?.find((item) => item.backend === this.registry.type)
+      const expectedContainer = this.registry.type === "supermemory"
+        ? containerTagFor(this.config, record.scope)
+        : undefined
+      if (!eligible && (record.backendMappings?.length ?? 0) > 0) {
+        await this.indexMemory(record)
+      } else if (eligible && (!mapping || (expectedContainer && mapping.containerTag !== expectedContainer))) {
+        await this.indexMemory(record)
+      }
     }
   }
 
@@ -617,7 +814,7 @@ export class MemoryGateway {
       validFrom: candidate.validFrom,
       validUntil: candidate.validUntil,
       reason: candidate.rationale,
-    }, source.actor, { ...scope, ...candidate.scope } as MemoryScope)
+    }, source.actor, scope, source)
   }
 }
 

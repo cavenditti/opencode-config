@@ -10,6 +10,7 @@
  * until finalized.
  */
 import type { Database } from "bun:sqlite"
+import { unlinkSync } from "node:fs"
 import type {
   EvidenceEvent, EvidenceEventType, ActorReference, RepositoryContext,
   RedactionResult, CapturePolicy, BlobReference,
@@ -121,7 +122,8 @@ export class Journal {
       event.summary, event.payload ? JSON.stringify(event.payload) : null,
       event.payloadRef ? JSON.stringify(event.payloadRef) : null,
       event.sensitivity, JSON.stringify(event.redaction), JSON.stringify(event.capturePolicy),
-      "pending", 0, null, new Date().toISOString(),
+      event.capturePolicy.extractionEligible ? "pending" : "processed",
+      0, null, new Date().toISOString(),
     )
   }
 
@@ -211,7 +213,14 @@ export class Journal {
 
   failedBatches(sessionId: string): { id: string; status: string; error: string | null; attempts: number }[] {
     return this.db.prepare(
-      `SELECT id, status, error, candidate_count FROM processing_batches WHERE session_id = ? AND status = 'failed' ORDER BY started_at DESC`,
+      `SELECT b.id, b.status, b.error, COALESCE(MAX(e.attempts), 0) AS attempts
+       FROM processing_batches b
+       LEFT JOIN events e
+         ON e.session_id = b.session_id
+        AND e.sequence BETWEEN b.first_sequence AND b.last_sequence
+       WHERE b.session_id = ? AND b.status = 'failed'
+       GROUP BY b.id, b.status, b.error, b.started_at
+       ORDER BY b.started_at DESC`,
     ).all(sessionId) as { id: string; status: string; error: string | null; attempts: number }[]
   }
 
@@ -222,6 +231,43 @@ export class Journal {
         `UPDATE events SET processing_status = 'pending' WHERE session_id = ? AND processing_status IN ('processed','deadletter')`,
       ).run(sessionId)
       return res.changes
+    })
+    return tx()
+  }
+
+  /** Apply configured retention without deleting pending/in-flight evidence. */
+  prune(retainRawDays: number, retainBlobsDays: number, now: number = Date.now()): { events: number; batches: number; blobs: number } {
+    const rawCutoff = new Date(now - Math.max(0, retainRawDays) * 86_400_000).toISOString()
+    const blobCutoff = new Date(now - Math.max(0, retainBlobsDays) * 86_400_000).toISOString()
+    const tx = this.db.transaction(() => {
+      const eventResult = this.db.prepare(
+        `DELETE FROM events
+         WHERE processing_status IN ('processed','deadletter')
+           AND created_at < ?
+           AND COALESCE(json_extract(capture_policy_json, '$.retentionClass'), 'standard') != 'permanent'`,
+      ).run(rawCutoff)
+      const batchResult = this.db.prepare(
+        "DELETE FROM processing_batches WHERE status IN ('completed','failed','deadletter') AND completed_at < ?",
+      ).run(rawCutoff)
+      const blobs = this.db.prepare(
+        `SELECT b.id, b.storage_path FROM blobs b
+         WHERE b.created_at < ? AND b.retention_class != 'permanent'
+           AND NOT EXISTS (
+             SELECT 1 FROM events e WHERE json_extract(e.payload_ref, '$.blobId') = b.id
+           )`,
+      ).all(blobCutoff) as { id: string; storage_path: string }[]
+      let deletedBlobs = 0
+      for (const blob of blobs) {
+        try { unlinkSync(blob.storage_path) } catch (error) {
+          if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") continue
+        }
+        this.db.prepare("DELETE FROM blobs WHERE id = ?").run(blob.id)
+        deletedBlobs++
+      }
+      this.db.prepare(
+        "DELETE FROM sequence_state WHERE session_id NOT IN (SELECT DISTINCT session_id FROM events)",
+      ).run()
+      return { events: eventResult.changes, batches: batchResult.changes, blobs: deletedBlobs }
     })
     return tx()
   }

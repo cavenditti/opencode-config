@@ -24,9 +24,9 @@ import {
   type MemoryRecord, type EvidenceEventType, type MemoryScope,
   type ExtractedCandidate, type ExtractedContradiction, type SessionCapsule, type MemoryConflict,
   type ActorReference, type EvidenceReference, type MemorySource,
-  capsuleId, conflictId, statementHash,
+  capsuleId, conflictId, statementHash, memoryVisibleFrom, isExpired,
 } from "./domain.ts"
-import { containsSecret } from "./redaction.ts"
+import { containsSecret, redactPayload } from "./redaction.ts"
 
 interface PendingSession {
   sessionId: string
@@ -38,6 +38,7 @@ interface PendingSession {
 export class MemoryWorker {
   private running = false
   private inflight = new Set<string>()
+  private lastPrunedAt = 0
   constructor(
     private config: MemoryConfig,
     private dbs: Databases,
@@ -69,6 +70,12 @@ export class MemoryWorker {
     if (this.running) return { processed: 0, sessions: 0 }
     this.running = true
     try {
+      const now = Date.now()
+      if (now - this.lastPrunedAt >= 86_400_000) {
+        this.journal.prune(this.config.retainRawDays, this.config.retainBlobsDays, now)
+        await this.gateway.maintainIndexes()
+        this.lastPrunedAt = now
+      }
       const sessions = this.dueSessions()
       let processed = 0
       for (const s of sessions) {
@@ -88,10 +95,11 @@ export class MemoryWorker {
 
   private dueSessions(): PendingSession[] {
     const rows = this.dbs.journal.prepare(
-      `SELECT session_id, COUNT(*) AS cnt, MAX(last_eligible_at) AS last
-       FROM events
-       WHERE processing_status = 'pending'
-       GROUP BY session_id`,
+      `SELECT e.session_id, COUNT(*) AS cnt, s.last_eligible_at AS last
+       FROM events e
+       LEFT JOIN sequence_state s ON s.session_id = e.session_id
+       WHERE e.processing_status = 'pending'
+       GROUP BY e.session_id, s.last_eligible_at`,
     ).all() as { session_id: string; cnt: number; last: string | null }[]
     const now = Date.now()
     const out: PendingSession[] = []
@@ -138,8 +146,16 @@ export class MemoryWorker {
     try {
       result = await extractFromBatch(coalesced, ctx, this.store, this.config)
     } catch (error) {
-      this.journal.markBatch(claim.batchId, "failed", error instanceof Error ? error.message : String(error), 0)
-      this.journal.settleEvents(claim.events.map((e) => e.id), false)
+      const exhausted = claim.events.filter((event) => event.attempts + 1 >= this.config.batching.maxAttempts)
+      const retryable = claim.events.filter((event) => event.attempts + 1 < this.config.batching.maxAttempts)
+      this.journal.markBatch(
+        claim.batchId,
+        retryable.length ? "failed" : "deadletter",
+        error instanceof Error ? error.message : String(error),
+        0,
+      )
+      this.journal.markDeadletter(exhausted.map((event) => event.id))
+      this.journal.settleEvents(retryable.map((event) => event.id), false)
       return 0
     }
 
@@ -213,6 +229,8 @@ export class MemoryWorker {
     for (const e of events.slice(0, 8)) {
       const local = this.store.ftsSearch(e.summary.slice(0, 120), 3)
       for (const { record } of local) {
+        if (!memoryVisibleFrom(scope, record)) continue
+        if (!["approved", "observational", "challenged"].includes(record.status) || isExpired(record)) continue
         if (!out.find((r) => r.id === record.id)) {
           out.push({ id: record.id, statement: record.statement, statementHash: statementHash(record.statement) })
         }
@@ -222,12 +240,13 @@ export class MemoryWorker {
   }
 
   private upsertCapsule(sessionId: string, scope: MemoryScope, patch: Partial<SessionCapsule>, existing?: SessionCapsule): void {
+    const sanitized = redactPayload(patch).payload as Partial<SessionCapsule>
     const now = new Date().toISOString()
     const base: SessionCapsule = existing ?? {
       id: capsuleId(),
       sessionId,
       scope,
-      objective: patch.objective ?? "ongoing session",
+      objective: sanitized.objective ?? "ongoing session",
       outcome: "ongoing",
       userRequirements: [],
       decisions: [],
@@ -244,15 +263,18 @@ export class MemoryWorker {
     }
     const merged: SessionCapsule = {
       ...base,
-      objective: patch.objective ?? base.objective,
-      outcome: patch.outcome ?? base.outcome,
-      userRequirements: dedupe([...base.userRequirements, ...(patch.userRequirements ?? [])]),
-      decisions: dedupe([...base.decisions, ...(patch.decisions ?? [])]),
-      discoveries: dedupe([...base.discoveries, ...(patch.discoveries ?? [])]),
-      failures: [...base.failures, ...(patch.failures ?? [])],
-      resolutions: [...base.resolutions, ...(patch.resolutions ?? [])],
-      unresolvedQuestions: dedupe([...base.unresolvedQuestions, ...(patch.unresolvedQuestions ?? [])]),
-      nextActions: dedupe([...base.nextActions, ...(patch.nextActions ?? [])]),
+      objective: sanitized.objective ?? base.objective,
+      outcome: sanitized.outcome ?? base.outcome,
+      userRequirements: dedupe([...base.userRequirements, ...(sanitized.userRequirements ?? [])]),
+      decisions: dedupe([...base.decisions, ...(sanitized.decisions ?? [])]),
+      discoveries: dedupe([...base.discoveries, ...(sanitized.discoveries ?? [])]),
+      filesChanged: dedupe([...base.filesChanged, ...(sanitized.filesChanged ?? [])]),
+      commandsOfInterest: dedupe([...base.commandsOfInterest, ...(sanitized.commandsOfInterest ?? [])]),
+      failures: dedupe([...base.failures, ...(sanitized.failures ?? [])]),
+      resolutions: dedupe([...base.resolutions, ...(sanitized.resolutions ?? [])]),
+      unresolvedQuestions: dedupe([...base.unresolvedQuestions, ...(sanitized.unresolvedQuestions ?? [])]),
+      nextActions: dedupe([...base.nextActions, ...(sanitized.nextActions ?? [])]),
+      evidenceEventIds: dedupe([...base.evidenceEventIds, ...(sanitized.evidenceEventIds ?? [])]),
     }
     if (existing) {
       // Replace by deleting + recreating (capsules are append-only summaries).

@@ -19,7 +19,7 @@ import { actorRef } from "./domain.ts"
 export interface ToolDeps {
   config: MemoryConfig
   gateway: MemoryGateway
-  resolveScope: (ctx: { directory?: string; worktree?: string; sessionId?: string; agent?: string; userId?: string }) => Promise<MemoryScope>
+  resolveScope: (ctx: { directory?: string; worktree?: string; sessionID?: string; agent?: string; userId?: string }) => Promise<MemoryScope>
 }
 
 const schema = tool.schema
@@ -90,8 +90,9 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
       includeEvidence: schema.boolean().optional().describe("Include supporting evidence event summaries (default true)."),
       includeHistory: schema.boolean().optional().describe("Include review history (default true)."),
     },
-    async execute(args) {
-      const result = await gateway.get(args.memoryId, {
+    async execute(args, context) {
+      const scope = await resolveScope(context)
+      const result = await gateway.getForScope(args.memoryId, scope, {
         includeEvidence: args.includeEvidence ?? true,
         includeHistory: args.includeHistory ?? true,
       })
@@ -102,12 +103,12 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
 
   const memory_propose = tool({
     description:
-      "Propose a durable memory for shared recall. Use when you discover a durable requirement, decision, verified fact, reusable procedure, important lesson, or unresolved contradiction. Proposals enter pending review unless they match a safe auto-accept policy (bounded observational facts, scoped user requirements, repository-verified facts). Never store secrets, transient details, or unsupported assumptions. Provide evidence references where possible.",
+      "Propose durable memory for the current project. Project identity cannot be overridden; session/branch/component fields may only narrow it. Use for durable requirements, decisions, verified facts, reusable procedures, important lessons, or unresolved contradictions. Never store secrets, transient details, or unsupported assumptions. Global sharing requires the separate memory_approve_global tool and explicit user permission.",
     args: {
       kind: schema.string().describe("fact | decision | requirement | constraint | preference | procedure | lesson | incident | hypothesis | episode | artifact | relation."),
       statement: schema.string().min(1).max(4000).describe("A single atomic, self-contained proposition. Entity-centric, under 60 words preferred."),
       structuredPayload: schema.record(schema.string(), schema.unknown()).optional(),
-      scope: schema.record(schema.string(), schema.unknown()).optional().describe("Override/scope the memory: userId, projectId, repositoryId, branch, component, environment, sessionId. Narrower scope is better."),
+      scope: schema.record(schema.string(), schema.unknown()).optional().describe("Optional narrowing within the current project: branch, component, environment, or current sessionId. Project/user/repository identity cannot be overridden."),
       evidence: schema.array(schema.record(schema.string(), schema.unknown())).optional().describe("Supporting evidence refs: { eventId?, filePath?, commit?, description? }."),
       confidence: schema.number().min(0).max(1).describe("0..1: how well evidence supports this claim."),
       durability: schema.string().describe("session | project | long_term."),
@@ -140,6 +141,38 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
     },
   })
 
+  const memory_approve_global = tool({
+    description:
+      "Promote one current-project memory to global user memory. This always requests one-shot interactive permission from the user for the exact memory; approval cannot be delegated to an agent or reviewer and is never remembered. Call only when the user explicitly asks to share a memory across projects.",
+    args: {
+      memoryId: schema.string().min(1).describe("Current-project memory to promote globally."),
+      rationale: schema.string().min(1).describe("Why this memory should apply across all projects."),
+    },
+    async execute(args, context) {
+      const scope = await resolveScope(context)
+      const existing = await gateway.getForScope(args.memoryId, scope, { includeEvidence: false, includeHistory: false })
+      if (!existing) return { title: "Not found", output: "Memory is not visible in the current project." }
+      await context.ask({
+        permission: "memory_global",
+        patterns: [args.memoryId],
+        always: [],
+        metadata: {
+          action: "Promote project memory to global memory",
+          memoryId: args.memoryId,
+          statement: existing.record.statement,
+          sourceProjectId: scope.projectId,
+          rationale: args.rationale,
+        },
+      })
+      const approver = actorRef("user", scope.userId ?? "user")
+      const promoted = await gateway.promoteGlobal(args.memoryId, scope, approver, args.rationale)
+      return {
+        title: "Global memory approved",
+        output: `Memory ${promoted.id} is now global after explicit interactive user approval.`,
+      }
+    },
+  })
+
   const memory_relate = tool({
     description:
       "Create a typed relation between two known memories or entities. Persists structurally; graph traversal is not provided in the first release. Use to record dependencies, support, contradiction links, or alternatives.",
@@ -153,7 +186,7 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
     async execute(args, context) {
       const scope = await resolveScope(context)
       const actor = actorRef("agent", context.agent)
-      const res = await gateway.relate(args.subjectId, args.predicate as never, args.objectId, args.evidence as never, args.confidence, actor)
+      const res = await gateway.relate(args.subjectId, args.predicate as never, args.objectId, args.evidence as never, args.confidence, actor, scope)
       return { title: `Relation ${res.id.slice(0, 16)}…`, output: `Linked ${args.subjectId} --${args.predicate}--> ${args.objectId}.` }
     },
   })
@@ -216,7 +249,8 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
     async execute(args, context) {
       const guard = reviewerGuard(config, context.agent)
       if (guard) return { title: "Denied", output: guard }
-      const items = await gateway.listPending(args.limit ?? 50, args.kind as never)
+      const scope = await resolveScope(context)
+      const items = await gateway.listPending(scope, args.limit ?? 50, args.kind as never)
       if (!items.length) return { title: "No pending memories", output: "No pending memory candidates." }
       return { title: `${items.length} pending`, output: items.map(renderPendingItem).join("\n\n") }
     },
@@ -243,7 +277,8 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
       // Self-approval prevention: reviewer may not approve a memory they
       // extracted. The extractor actor id is "memory-worker"; reviewer agents
       // are distinct, so this is enforced structurally, but guard explicitly.
-      const existing = await gateway.get(args.memoryId, { includeEvidence: false, includeHistory: true })
+      const scope = await resolveScope(context)
+      const existing = await gateway.getForScope(args.memoryId, scope, { includeEvidence: false, includeHistory: true })
       if (existing && existing.record.source.actor.id === context.agent && (args.decision === "approve" || args.decision === "edit_and_approve")) {
         return { title: "Denied", output: "Cannot approve your own extracted output; escalate to a different reviewer or human." }
       }
@@ -257,7 +292,7 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
         duplicateOf: args.duplicateOf,
         supersededByMemoryId: args.supersededByMemoryId,
         escalateTo: args.escalateTo as never,
-      }, reviewer)
+      }, reviewer, scope)
       return { title: `Review: ${res.status}`, output: `Memory ${res.memoryId} is now ${res.status}.` }
     },
   })
@@ -290,7 +325,8 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
       const guard = reviewerGuard(config, context.agent)
       if (guard) return { title: "Denied", output: guard }
       const reviewer = actorRef("reviewer", context.agent)
-      const res = await gateway.mergeDuplicates(args.keepId, args.dropIds, reviewer)
+      const scope = await resolveScope(context)
+      const res = await gateway.mergeDuplicates(args.keepId, args.dropIds, reviewer, scope)
       return { title: `Merged ${res.merged}`, output: `Merged ${res.merged} duplicate(s) into ${args.keepId}.` }
     },
   })
@@ -300,6 +336,7 @@ export function buildTools(deps: ToolDeps): Record<string, ToolDefinition> {
     memory_search,
     memory_get,
     memory_propose,
+    memory_approve_global,
     memory_relate,
     memory_challenge,
     memory_checkpoint,

@@ -162,8 +162,9 @@ export async function extractFromBatch(
   }
 
   const window = buildWindow(events, ctx, config)
-  const apiKey = resolveOpenRouterKey(config)
-  if (!apiKey && config.extraction.provider === "openrouter") {
+  const apiKey = config.extraction.provider === "openrouter" ? resolveOpenRouterKey(config) : undefined
+  if ((config.extraction.provider === "openrouter" && !apiKey) ||
+      (config.extraction.provider === "external" && !config.extraction.externalUrl)) {
     // No key: degrade to deterministic observational memories only.
     return deterministicObservational(window, events)
   }
@@ -172,7 +173,9 @@ export async function extractFromBatch(
   const lastError = null
   for (let attempt = 0; attempt <= config.extraction.retryCount; attempt++) {
     try {
-      const content = await callOpenRouter(config, apiKey!, userPrompt, attempt === config.extraction.retryCount)
+      const content = config.extraction.provider === "external"
+        ? await callExternalExtractor(config, userPrompt, attempt === config.extraction.retryCount)
+        : await callOpenRouter(config, apiKey!, userPrompt, attempt === config.extraction.retryCount)
       const parsed = parseJsonLenient(content)
       if (!parsed) {
         continue
@@ -186,6 +189,31 @@ export async function extractFromBatch(
   }
   // Fallback: deterministic observational extraction.
   return deterministicObservational(window, events)
+}
+
+async function callExternalExtractor(config: MemoryConfig, userPrompt: string, finalAttempt: boolean): Promise<string> {
+  const model = finalAttempt && config.extraction.escalationModel ? config.extraction.escalationModel : config.extraction.model
+  const headers: Record<string, string> = { "content-type": "application/json" }
+  const apiKey = config.extraction.apiKey ?? process.env[config.extraction.apiKeyEnv]
+  if (apiKey) headers.authorization = `Bearer ${apiKey}`
+  const res = await fetch(config.extraction.externalUrl!, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      temperature: config.extraction.temperature,
+      systemPrompt: SYSTEM_PROMPT,
+      userPrompt: userPrompt.slice(0, config.extraction.maxInputTokens * 4),
+      outputSchema: OUTPUT_SCHEMA,
+    }),
+    signal: AbortSignal.timeout(config.extraction.timeoutMs),
+  })
+  if (!res.ok) throw new Error(`external extraction HTTP ${res.status}`)
+  const json = await res.json() as { content?: unknown; result?: unknown; candidates?: unknown }
+  if (typeof json.content === "string") return json.content
+  if (json.result && typeof json.result === "object") return JSON.stringify(json.result)
+  if (Array.isArray(json.candidates)) return JSON.stringify(json)
+  throw new Error("external extraction returned no content or result")
 }
 
 function buildWindow(events: EventRow[], ctx: ExtractionContext, config: MemoryConfig): { events: EventRow[]; related: ExtractionContext["existingRelated"]; capsule?: SessionCapsule; scope: MemoryScope } {
@@ -287,14 +315,14 @@ function deterministicObservational(_window: { events: EventRow[]; related: Extr
     if (e.event_type === "tool.after" || e.event_type === "tool.error") {
       const payload = e.payload as { tool?: string; exitCode?: number; error?: string } | null
       const tool = payload?.tool ?? "unknown"
-      const ok = e.event_type === "tool.after" && payload?.exitCode === 0
+      const completed = e.event_type === "tool.after"
       if (tool === "unknown") continue
       candidates.push({
         kind: "fact",
-        statement: `${tool} ${ok ? "succeeded" : "failed"}${payload?.exitCode != null ? ` (exit ${payload.exitCode})` : ""} in session ${e.session_id.slice(0, 8)}.`,
+        statement: `${tool} ${completed ? "completed" : "failed"}${payload?.exitCode != null ? ` (exit ${payload.exitCode})` : ""} in session ${e.session_id.slice(0, 8)}.`,
         scope: { sessionId: e.session_id },
         evidenceEventIds: [e.id],
-        confidence: ok ? 0.95 : 0.9,
+        confidence: completed ? 0.95 : 0.9,
         durability: "session",
         importance: "low",
         reviewRecommendation: "auto_observational",

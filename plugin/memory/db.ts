@@ -112,7 +112,8 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at TEXT NOT NULL,
     created_by_json TEXT NOT NULL,
     reviewed_by_json TEXT,
-    review_id TEXT
+    review_id TEXT,
+    global_approval_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mem_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_mem_kind ON memories(kind);
@@ -200,6 +201,8 @@ export function openDatabases(paths: DbPaths): Databases {
 
   journal.exec(SCHEMA_JOURNAL)
   store.exec(SCHEMA_STORE)
+  ensureColumn(store, "memories", "global_approval_json", "TEXT")
+  migrateLegacyScopes(store)
 
   return {
     journal,
@@ -209,6 +212,38 @@ export function openDatabases(paths: DbPaths): Databases {
       try { journal.close() } catch {}
       try { store.close() } catch {}
     },
+  }
+}
+
+function ensureColumn(db: Database, table: string, column: string, type: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+  if (!columns.some((item) => item.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`)
+  }
+}
+
+/**
+ * Older releases merged the live session and commit into every proposal,
+ * including project/long-term memories. That made otherwise durable records
+ * disappear after the session ended or HEAD advanced. Remove only those
+ * provably transient dimensions; retain branch/component constraints because
+ * they may have been intentional.
+ */
+function migrateLegacyScopes(db: Database): void {
+  const rows = db.prepare(
+    "SELECT id, scope_json, durability FROM memories WHERE durability != 'session'",
+  ).all() as { id: string; scope_json: string; durability: string }[]
+  const update = db.prepare("UPDATE memories SET scope_json = ?, updated_at = ? WHERE id = ?")
+  const now = new Date().toISOString()
+  for (const row of rows) {
+    let scope: Record<string, unknown>
+    try { scope = JSON.parse(row.scope_json) as Record<string, unknown> } catch { continue }
+    if (!scope.projectId) continue
+    if (!("sessionId" in scope) && !("commitFrom" in scope) && !("commitTo" in scope)) continue
+    delete scope.sessionId
+    delete scope.commitFrom
+    delete scope.commitTo
+    update.run(JSON.stringify(scope), now, row.id)
   }
 }
 

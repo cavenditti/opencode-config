@@ -34,6 +34,7 @@ export interface IndexableMemory {
   evidenceCount: number
   sourceType: string
   createdBy: string
+  globalApproved: boolean
   backendId?: string
   containerTag?: string
 }
@@ -89,7 +90,7 @@ function indexableFrom(record: MemoryRecord): IndexableMemory {
     evidenceCount: record.evidence.length,
     sourceType: record.source.type,
     createdBy: record.createdBy.id,
-    containerTag: scopeContainerTag(record.scope),
+    globalApproved: !!record.globalApproval,
   }
 }
 
@@ -150,8 +151,7 @@ export class SupermemoryBackend implements MemoryBackend {
   }
 
   private containerFor(scope: MemoryScope): string {
-    const base = scopeContainerTag(scope)
-    return this.config.backend.containerTagPrefix + ":" + base
+    return containerTagFor(this.config, scope)
   }
 
   async index(record: IndexableMemory): Promise<BackendRecordReference> {
@@ -176,7 +176,7 @@ export class SupermemoryBackend implements MemoryBackend {
   async update(reference: BackendRecordReference, record: IndexableMemory): Promise<BackendRecordReference> {
     const containerTag = reference.containerTag ?? this.containerFor(record.scope)
     try {
-      await fetch(`${this.baseUrl}/v4/memories`, {
+      const res = await fetch(`${this.baseUrl}/v4/memories`, {
         method: "PATCH",
         headers: this.authHeaders(),
         body: JSON.stringify({
@@ -185,6 +185,7 @@ export class SupermemoryBackend implements MemoryBackend {
           metadata: this.metadataFor(record),
         }),
       })
+      if (!res.ok) throw new Error(`supermemory update HTTP ${res.status}: ${await safeText(res)}`)
     } catch (error) {
       // PATCH may fail if the memory was forgotten; fall back to re-index.
       return this.index(record)
@@ -194,11 +195,12 @@ export class SupermemoryBackend implements MemoryBackend {
 
   async remove(reference: BackendRecordReference): Promise<void> {
     if (!reference.backendId) return
-    await fetch(`${this.baseUrl}/v4/memories`, {
+    const res = await fetch(`${this.baseUrl}/v4/memories`, {
       method: "DELETE",
       headers: this.authHeaders(),
       body: JSON.stringify({ id: reference.backendId, containerTag: reference.containerTag, reason: "lifecycle transition" }),
     })
+    if (!res.ok) throw new Error(`supermemory remove HTTP ${res.status}: ${await safeText(res)}`)
   }
 
   async search(query: BackendSearchQuery): Promise<BackendSearchResult[]> {
@@ -295,6 +297,7 @@ export class SupermemoryBackend implements MemoryBackend {
       validUntil: record.validUntil ?? null,
       createdBy: record.createdBy,
       evidenceCount: record.evidenceCount,
+      globalApproved: record.globalApproved,
     }
   }
 
@@ -312,11 +315,15 @@ export class SupermemoryBackend implements MemoryBackend {
 }
 
 function scopeLabel(scope: MemoryScope): string {
-  if (scope.repositoryId) return "repository"
   if (scope.projectId) return "project"
+  if (scope.repositoryId) return "repository"
   if (scope.workspaceId) return "workspace"
   if (scope.userId) return "global user"
   return "session"
+}
+
+export function containerTagFor(config: MemoryConfig, scope: MemoryScope): string {
+  return config.backend.containerTagPrefix + ":" + scopeContainerTag(scope)
 }
 
 async function safeText(res: Response): Promise<string> {

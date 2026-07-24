@@ -122,6 +122,14 @@ export interface MemoryScopeSelector extends Partial<MemoryScope> {
   match?: "exact" | "include_narrower" | "include_broader"
 }
 
+export interface GlobalMemoryApproval {
+  approvedAt: string
+  approvedBy: ActorReference
+  method: "interactive_permission"
+  rationale: string
+  sourceProjectId: string
+}
+
 // Scope specificity, most-specific first. Higher = narrower.
 const SCOPE_RANK: Record<keyof MemoryScope, number> = {
   sessionId: 6,
@@ -159,9 +167,19 @@ export function scopeKey(scope: MemoryScope): string {
 
 /** Distinct container-tag value for a scope (broadest shared space). */
 export function scopeContainerTag(scope: MemoryScope): string {
-  if (scope.userId) return "user:" + scope.userId
-  if (scope.workspaceId) return "workspace:" + scope.workspaceId
+  if (scope.projectId) return "project:" + shortHash(scope.projectId)
+  if (scope.repositoryId) return "repository:" + shortHash(scope.repositoryId)
+  if (scope.workspaceId) return "workspace:" + shortHash(scope.workspaceId)
+  if (scope.userId) return "user:" + shortHash(scope.userId)
   return "global"
+}
+
+export function isProjectScope(scope: MemoryScope): boolean {
+  return typeof scope.projectId === "string" && scope.projectId.length > 0
+}
+
+export function isGlobalScope(scope: MemoryScope): boolean {
+  return !isProjectScope(scope)
 }
 
 export function scopeDepth(scope: MemoryScope): number {
@@ -174,8 +192,7 @@ export function scopeDepth(scope: MemoryScope): number {
 
 /** Whether `candidate` scope is visible from `current` scope. */
 export function scopeCompatible(current: MemoryScope, candidate: MemoryScope): boolean {
-  // A candidate is visible if every dimension it specifies is either
-  // unspecified in current (broader-than-current => visible) or equal.
+  // Every candidate dimension must also exist and match in current scope.
   const dims: (keyof MemoryScope)[] = [
     "userId", "organizationId", "workspaceId", "projectId",
     "repositoryId", "branch", "worktreeId", "component", "environment",
@@ -183,14 +200,12 @@ export function scopeCompatible(current: MemoryScope, candidate: MemoryScope): b
   for (const dim of dims) {
     const c = candidate[dim]
     const n = current[dim]
-    if (c != null && n != null && c !== n) return false
+    if (c != null && c !== n) return false
   }
-  // Commit-bounded candidate: only visible when current commit within range.
-  if (candidate.commitFrom || candidate.commitTo) {
-    if (!current.commitFrom) return false
-    if (candidate.commitFrom && current.commitFrom < candidate.commitFrom) return false
-    if (candidate.commitTo && current.commitFrom > candidate.commitTo) return false
-  }
+  // Commit hashes are opaque, not lexically ordered. Without a repository
+  // ancestry query the only safe pure comparison is an exact bound.
+  if (candidate.commitFrom && current.commitFrom !== candidate.commitFrom) return false
+  if (candidate.commitTo && current.commitFrom !== candidate.commitTo) return false
   // Session-scoped candidate: only within that session unless caller broadens.
   if (candidate.sessionId && candidate.sessionId !== current.sessionId) {
     return false
@@ -328,7 +343,22 @@ export interface MemoryRecord {
   createdBy: ActorReference
   reviewedBy?: ActorReference
   reviewId?: string
+  globalApproval?: GlobalMemoryApproval
   backendMappings?: BackendMapping[]
+}
+
+/**
+ * Project memories are visible only inside the exact OpenCode project that
+ * created them. Project-less records are global and stay invisible until a
+ * user explicitly approves promotion through an interactive permission.
+ */
+export function memoryVisibleFrom(current: MemoryScope, record: Pick<MemoryRecord, "scope" | "globalApproval">): boolean {
+  if (isProjectScope(record.scope)) {
+    if (!current.projectId || record.scope.projectId !== current.projectId) return false
+    return scopeCompatible(current, record.scope)
+  }
+  if (!record.globalApproval || record.globalApproval.approvedBy.kind !== "user") return false
+  return scopeCompatible(current, record.scope)
 }
 
 export interface MemoryReview {
@@ -708,6 +738,9 @@ export function isExpired(record: MemoryRecord, now: number = Date.now()): boole
 }
 
 export function indexEligible(record: MemoryRecord, includePending: boolean = false): boolean {
+  if (isGlobalScope(record.scope) && (!record.globalApproval || record.globalApproval.approvedBy.kind !== "user")) {
+    return false
+  }
   if (record.status === "approved") return true
   if (record.status === "observational") return true
   if (record.status === "challenged") return true

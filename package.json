@@ -7,7 +7,7 @@
     "test:bash-plugin": "node test/bash-plugin.test.ts",
     "test:webfetch": "node test/webfetch-gate.test.ts",
     "test:webfetch-plugin": "node test/webfetch-plugin.test.ts",
-    "test:memory": "node plugin/memory/smoke.ts",
+    "test:memory": "tsc --ignoreConfig --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --types bun --rewriteRelativeImportExtensions --outDir /tmp/opencode-memory-compiled-test plugin/memory/smoke.ts && node /tmp/opencode-memory-compiled-test/smoke.js",
     "test": "pnpm run typecheck && pnpm run test:english-guard && pnpm run test:permission-gate && pnpm run test:bash-plugin && pnpm run test:webfetch && pnpm run test:webfetch-plugin && pnpm run test:memory"
   },
   "dependencies": {

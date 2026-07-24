@@ -27,6 +27,7 @@
     },
     "edit": "ask",
     "external_directory": "deny",
+    "memory_global": "ask",
     "task": "ask"
   }
 }

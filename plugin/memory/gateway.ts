@@ -121,13 +121,13 @@ export class MemoryGateway {
   // ── Explicit propose ──────────────────────────────────────────────────────
 
   async propose(input: ProposeInput, actor: ActorReference, scope: MemoryScope): Promise<ProposeResult> {
-    const issues = validatePropose(input)
+    const scopeResolved = { ...scope, ...input.scope } as MemoryScope
+    const issues = validatePropose({ ...input, scope: scopeResolved })
     if (issues.length) {
       throw new Error(`invalid propose: ${issues.map((i) => i.field + ": " + i.message).join("; ")}`)
     }
     const hash = statementHash(input.statement)
     const existing = this.store.byStatementHash(hash)
-    const scopeResolved = { ...scope, ...input.scope } as MemoryScope
 
     // Duplicate detection: exact hash within a compatible scope.
     for (const mem of existing) {

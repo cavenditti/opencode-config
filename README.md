@@ -8,7 +8,9 @@ Carlo's personal global configuration for [opencode](https://opencode.ai), kept 
 |------|-------------|
 | `opencode.jsonc` | main config (model, default agent, schema) |
 | `agent/` | custom subagents (orchestrator, coder, reviewer, guru, researcher, browser-reader, browser-operator, web-debugger, crawler, toolsmith) |
-| `plugin/` | guarded bash tool: deterministic checks + DS4-flash classifier with GLM-5.2 deny-escalation; `plugin/bash.ts` permission integration |
+| `plugin/` | guarded bash and webfetch tools, plus enforcement and shared-memory plugins |
+| `test/` | tests kept outside `plugin/` so OpenCode does not auto-load them |
+| `webfetch-rules.json` | optional URL-pattern overrides for the guarded webfetch tool |
 | `package.json` | plugin dependencies |
 | `pnpm-lock.yaml` | lockfile (pnpm is the package manager) |
 
@@ -23,6 +25,14 @@ Carlo's personal global configuration for [opencode](https://opencode.ai), kept 
 The guarded `bash` tool in `plugin/bash.ts` overrides the built-in bash tool. It first applies deterministic hard rules (hard-deny of irreversible system damage and secret/credential access — these always hard-block), then a metacharacter/path gate and a safe-command allowlist, then asks `deepseek/deepseek-v4-flash` (thinking disabled, temperature 0) via OpenRouter for the final classification. It resolves the OpenRouter API key from opencode's own auth store (`~/.local/share/opencode/auth.json`), or from `OPENROUTER_API_KEY` if set. Alternatively, set `OPENCODE_SAFETY_URL` to use an external classifier service. The fail-safe verdict is `ask`.
 
 **Deny escalation (two-model):** when the DS4-flash classifier denies a command, it auto-escalates to `z-ai/glm-5.2` for a second opinion (longer 15s timeout). If GLM-5.2 allows AND neither model flagged a sensitive category (`destructive`/`irreversible`/`secret`/`credential`/`exfiltration`/`privilege`) AND GLM's risk < 50, the command runs (override). Otherwise — GLM also denies/asks, GLM is unavailable, or a sensitive category was flagged — the command escalates to the user via a **one-shot** `ask` (no permanent allowlist). LLM denials never hard-block; only the deterministic hard-deny layer throws. When `OPENCODE_SAFETY_URL` is set, external-classifier denies escalate to the user directly without a GLM call (privacy + policy coherence). Run `pnpm install` (the plugin dependency is already declared) and restart opencode after changing the plugin or config.
+
+### Webfetch gate
+
+`plugin/webfetch.ts` overrides the built-in `webfetch` while preserving its `url`, `format`, and `timeout` behavior. It blocks non-HTTP schemes, cloud metadata, IPv6 literals, and credential-bearing URLs; asks before secret-looking query strings, private-network destinations, or unresolved hosts; auto-allows verified public documentation hosts; and sends other public URLs to the low-cost classifier. Every redirect is checked again. Classifier denials escalate to a one-shot user prompt, while deterministic denials remain blocked.
+
+URL values are redacted before classifier calls, permission metadata, and tool titles. The plugin uses OpenCode's OpenRouter credential by default. Set `OPENCODE_WEBFETCH_SAFETY_URL` for a dedicated external classifier; otherwise `OPENCODE_SAFETY_URL` is used when present. Set `OPENCODE_WEBFETCH_INCLUDE_USER_MESSAGE=0` to omit conversational context from classifier calls. The fail-safe verdict is `ask`.
+
+Optional URL overrides live in `webfetch-rules.json`. Patterns use `*` and `?`, are evaluated in file order with last-match-wins, and cannot override the earlier scheme, cloud-metadata, IPv6, embedded-credential, or secret-query checks. The default `"*": "ask"` entry is a defer sentinel; add more-specific `allow`, `ask`, or `deny` entries after it. A deliberate rule can allow an otherwise private or DNS-unresolved destination.
 
 ## Web tooling stack
 

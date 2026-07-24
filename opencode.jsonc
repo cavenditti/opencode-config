@@ -5,7 +5,7 @@
   "small_model": "openrouter/deepseek/deepseek-v4-flash",
   "instructions": ["AGENTS.md"],
 
-  "plugin": ["./plugin/bash.ts", "./plugin/enforce.ts", "./plugin/memory.ts"],
+  "plugin": ["./plugin/bash.ts", "./plugin/enforce.ts", "./plugin/memory.ts", "./plugin/webfetch.ts"],
 
   "permission": {
     // Granular bash rules, honored by plugin/bash.ts between its secret-deny

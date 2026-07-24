@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["bun"],
+    "lib": ["ES2022", "DOM"],
+    "paths": {
+      "@opencode-ai/plugin": ["./node_modules/@opencode-ai/plugin/dist/index.d.ts"],
+      "@opencode-ai/sdk": ["./node_modules/@opencode-ai/sdk/dist/index.d.ts"]
+    }
+  },
+  "include": ["plugin/**/*.ts", "test/**/*.ts"]
+}

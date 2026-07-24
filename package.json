@@ -1,5 +1,20 @@
 {
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:webfetch": "node test/webfetch-gate.test.ts",
+    "test:webfetch-plugin": "node test/webfetch-plugin.test.ts",
+    "test:memory": "node plugin/memory/smoke.ts",
+    "test": "pnpm run typecheck && pnpm run test:webfetch && pnpm run test:webfetch-plugin && pnpm run test:memory"
+  },
   "dependencies": {
-    "@opencode-ai/plugin": "1.17.13"
+    "@opencode-ai/plugin": "1.18.4",
+    "htmlparser2": "^12.0.0",
+    "turndown": "^7.2.4"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/turndown": "^5.0.6",
+    "typescript": "^7.0.2"
   }
 }
